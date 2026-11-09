@@ -61,6 +61,11 @@ from vllm.distributed.kv_transfer.kv_connector.v1.base import (
     KVConnectorMetadata,
     KVConnectorTransferResults,
 )
+from vllm.distributed.kv_transfer.kv_connector.v1.metrics import (
+    KVConnectorPromMetrics,
+    PromMetric,
+    PromMetricT,
+)
 from vllm.distributed.kv_transfer.kv_connector.v1.offloading import (
     config as offloading_config_module,
 )
@@ -86,10 +91,12 @@ from vllm.v1.kv_offload.base import (
     GPULoadStoreSpec,
     OffloadKey,
 )
+from vllm.v1.metrics.cache_hit_source import CacheHitSource
 from vllm.v1.outputs import KVConnectorOutput
 
 from vllm_torchtpu import envs as tpu_envs
 from vllm_torchtpu.logger import init_logger
+from vllm_torchtpu.offload.metrics import RaidenOffloadPromMetrics, split_external_hit
 from vllm_torchtpu.offload.raiden_store import (
     AdmissionOp,
     RaidenLoadStoreSpec,
@@ -99,6 +106,8 @@ from vllm_torchtpu.offload.raiden_store import (
 
 if TYPE_CHECKING:
     from vllm.distributed.kv_events import KVCacheEvent
+    from vllm.v1.core.kv_cache_manager import KVCacheBlocks
+    from vllm.v1.request import Request
 
 logger = init_logger(__name__)
 
@@ -218,6 +227,47 @@ class TPURaidenOffloadingScheduler(OffloadingConnectorScheduler):
         self._raiden_manager: RaidenOffloadingManager = self.manager
         self._fence_pending: dict[int, _ParkedStore] = {}
 
+    def _load_spec(self, req_id: str) -> RaidenLoadStoreSpec:
+        """The source spec of the load job this step created for `req_id`."""
+        (job_id,) = self._req_status[req_id].transfer_jobs
+        src_spec = self._current_batch_load_jobs[job_id].src_spec
+        assert isinstance(src_spec, RaidenLoadStoreSpec)
+        return src_spec
+
+    def update_state_after_alloc(
+        self, request: Request, blocks: KVCacheBlocks, num_external_tokens: int
+    ):
+        super().update_state_after_alloc(request, blocks, num_external_tokens)
+        if num_external_tokens == 0:
+            return
+        src_spec = self._load_spec(request.request_id)
+        if not src_spec.pinned:
+            # Evicted before prepare_load acquired pins: no confirmed Raiden
+            # cache hit and no transfer job will run on the store.
+            return
+        # Attribute the hit while prepare_load's per-key tiers are recorded
+        # (they are cleared at the end of the scheduler step).
+        req_status = self._req_status[request.request_id]
+        start_token = req_status.num_locally_computed_tokens
+        src_spec.tokens_by_source = self._raiden_manager.compute_load_tokens_by_source(
+            start_token=start_token,
+            end_token=start_token + num_external_tokens,
+            load_key_ranges=req_status.load_key_ranges,
+        )
+        self._raiden_manager.record_admission_hits(
+            src_spec.tokens_by_source, preempted=request.num_preemptions > 0
+        )
+
+    def get_external_cache_hit_sources(
+        self, request: Request, num_external_tokens: int
+    ) -> dict[CacheHitSource, int]:
+        if num_external_tokens == 0:
+            return {}
+        # An unpinned load fails and recomputes, but the scheduler has already
+        # counted its tokens as hits, so they are reported as unspecified.
+        tokens_by_source = self._load_spec(request.request_id).tokens_by_source
+        return split_external_hit(tokens_by_source or {}, num_external_tokens)
+
     def build_connector_meta(
         self, scheduler_output: SchedulerOutput
     ) -> KVConnectorMetadata:
@@ -328,6 +378,22 @@ class TPURaidenOffloadingScheduler(OffloadingConnectorScheduler):
 
 class TPURaidenOffloadingConnector(OffloadingConnector):
     """Top-level facade connector for the store-backed (V2) raiden KV offload path."""
+
+    @classmethod
+    def build_prom_metrics(
+        cls,
+        vllm_config: VllmConfig,
+        metric_types: dict[type[PromMetric], type[PromMetricT]],
+        labelnames: list[str],
+        per_engine_labelvalues: dict[int, list[object]],
+    ) -> KVConnectorPromMetrics:
+        return RaidenOffloadPromMetrics(
+            vllm_config,
+            metric_types,
+            labelnames,
+            per_engine_labelvalues,
+            spec_cls=TPURaidenStoreOffloadingSpec,
+        )
 
     @classmethod
     def get_required_kvcache_layout(cls, vllm_config: VllmConfig) -> str | None:
