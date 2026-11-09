@@ -1,6 +1,6 @@
 # KV Cache Offloading Metrics
 
-With `TPURaidenOffloadingConnector`, alone or as a child of `TPUMultiConnector`, the `/metrics` endpoint shows which tier served each prefix-cache hit: the engine's host DRAM pool, the pool of another engine, or the storage tier. It also shows, for each tier, the tokens that were loaded, how long the loads took, and how many loads failed. For all other metrics, see [Production Metrics](https://docs.vllm.ai/en/latest/usage/metrics/) in the vLLM documentation.
+With `TPURaidenOffloadingConnector`, alone or as a child of `TPUMultiConnector`, the `/metrics` endpoint shows which tier served each prefix-cache hit: the engine's host DRAM pool, the pool of another engine, or the storage tier. It also shows, for each tier, the tokens that were loaded and saved, how long the loads and saves took, and how many of them failed. For all other metrics, see [Production Metrics](https://docs.vllm.ai/en/latest/usage/metrics/) in the vLLM documentation.
 
 ## `vllm:prompt_tokens_cached_by_source`
 
@@ -71,6 +71,35 @@ After a hit, the connector loads the cached blocks from their tiers into TPU mem
 **Failed loads.** A failed load counts once for each tier that failed: its read was refused, its transfer failed, or it was still running when the scheduler stopped waiting for the load. A tier that completed its part is not counted. For example, a load reads from host DRAM and from storage, and the read from storage fails: `disk` grows by 1 and `host` does not, and the load still records the latency of `host`. A load that the scheduler stopped waiting for records no latency.
 
 A hit whose blocks were evicted before the load started appears in none of the three metrics, because no transfer started.
+
+## Save metrics
+
+The connector saves the KV cache of a request from TPU memory (HBM) to the offload tiers. Three metrics follow these saves. In place of `source`, they have a `destination` label, for the tier that the save writes:
+
+| Metric | Type | Value |
+| :--- | :--- | :--- |
+| `vllm:kv_offload_raiden_saved_tokens` | Counter | The tokens that were saved to the tier. |
+| `vllm:kv_offload_raiden_save_observed_latency_seconds` | Histogram | The time that a save took, in seconds. |
+| `vllm:kv_offload_raiden_failed_save_jobs` | Counter | The saves that failed. |
+
+| `destination` | `backend` | Tier |
+| :--- | :--- | :--- |
+| `host` | `dram` | The engine's host DRAM pool. Every save writes it. |
+| `disk` | `posix`, the storage type | The storage tier. With a storage tier, a save writes host DRAM and storage, and is complete when storage has the data. |
+
+There is no `p2p` destination: an engine does not save into the pool of another engine.
+
+**Saved tokens.** A save counts its tokens when it has completed. With a storage tier, `host` and `disk` both grow by the tokens of the save. A save counts only the tokens that it writes, and each of them once:
+
+- A hybrid model saves attention KV and linear-attention state for the same tokens. Only the attention KV counts.
+- A block that is already in host DRAM is not saved again, and counts no tokens.
+- A save that fails counts no tokens.
+
+**Latency.** Each save that completed records one sample, under the tier where saves complete: `disk` with a storage tier, `host` without. The sample is the time from the start of the save until the scheduler sees it complete. It includes retries, and it is rounded up to the next scheduler step, like the load latency.
+
+**Failed saves.** A save that could not start counts under `host`, because the host DRAM pool refused it. A save that started and then failed counts under the tier where saves complete.
+
+The series of these metrics are created at 0 at startup too: the two counters for `host` and for a configured storage tier, and the latency for the tier where saves complete.
 
 ## Metrics that are not listed
 
