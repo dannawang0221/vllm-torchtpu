@@ -84,12 +84,17 @@ import socket
 import threading
 import time
 from collections import defaultdict
-from collections.abc import Mapping, Sequence
+from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, cast
 
 from vllm.config import VllmConfig
-from vllm.v1.kv_cache_interface import AttentionSpec, FullAttentionSpec, KVCacheConfig
+from vllm.v1.kv_cache_interface import (
+    AttentionSpec,
+    FullAttentionSpec,
+    KVCacheConfig,
+    MambaSpec,
+)
 from vllm.v1.kv_offload.base import (
     CanonicalKVCaches,
     LoadStoreSpec,
@@ -98,6 +103,7 @@ from vllm.v1.kv_offload.base import (
     Medium,
     OffloadingEvent,
     OffloadingManager,
+    OffloadingMetricMetadata,
     OffloadingSpec,
     OffloadingWorker,
     OffloadKey,
@@ -109,6 +115,7 @@ from vllm.v1.kv_offload.base import (
     get_offload_group_idx,
 )
 from vllm.v1.kv_offload.config import OffloadingConfig
+from vllm.v1.metrics.cache_hit_source import CacheHitSource
 
 from vllm_torchtpu import envs
 from vllm_torchtpu.block_major_pool import unified_block_major_enabled
@@ -117,9 +124,16 @@ from vllm_torchtpu.offload.block_major_layout import (
     BlockMajorContract,
     resolve_block_major_contract,
 )
+from vllm_torchtpu.offload.metrics import (
+    RaidenOffloadStatsCollector,
+    build_raiden_offload_metric_definitions,
+)
 
 if TYPE_CHECKING:
     import torch
+    from vllm.distributed.kv_transfer.kv_connector.v1.offloading.metrics import (
+        OffloadingConnectorStats,
+    )
 
 logger = init_logger(__name__)
 
@@ -238,6 +252,7 @@ class RaidenLoadStoreSpec(LoadStoreSpec):
     def __init__(self, keys: list[OffloadKey], pinned: bool = True):
         self.keys = keys
         self.pinned = pinned
+        self.tokens_by_source: dict[CacheHitSource, int] | None = None
 
     def __repr__(self) -> str:
         return (
@@ -351,6 +366,11 @@ class RaidenOffloadingManager(OffloadingManager):
         # `build_store_storage_backend_config`. Empty keeps the store DRAM-only.
         secondary_backend_configs: Sequence[object] = (),
         dp_rank: int = 0,
+        # Metrics geometry, derived by `TPURaidenStoreOffloadingSpec`:
+        # `storage_backend` labels the storage tier (None: DRAM-only).
+        tokens_per_chunk_by_group: Mapping[int, int] | None = None,
+        mamba_group_ids: Iterable[int] = (),
+        storage_backend: str | None = None,
         # Test overrides: allow injecting mock store instance and type bindings.
         store: Any = None,
         store_types: Any = None,
@@ -503,6 +523,34 @@ class RaidenOffloadingManager(OffloadingManager):
         self._admissions: dict[int, Admission] = {}
         self._hash_to_admission: dict[bytes, Admission] = {}
         self._finished: list[FinishedJob] = []
+        self._tokens_per_chunk_by_group: dict[int, int] = (
+            dict(tokens_per_chunk_by_group) if tokens_per_chunk_by_group else {}
+        )
+        self._mamba_group_ids: frozenset[int] = frozenset(mamba_group_ids)
+        self._metrics = RaidenOffloadStatsCollector(storage_backend=storage_backend)
+
+    def compute_load_tokens_by_source(
+        self,
+        *,
+        start_token: int,
+        end_token: int,
+        load_key_ranges: Iterable[tuple[int, int, OffloadKey]],
+    ) -> dict[CacheHitSource, int]:
+        return self._metrics.compute_load_tokens_by_source(
+            start_token=start_token,
+            end_token=end_token,
+            load_key_ranges=load_key_ranges,
+            tokens_per_chunk_by_group=self._tokens_per_chunk_by_group,
+            mamba_group_ids=self._mamba_group_ids,
+        )
+
+    def record_admission_hits(
+        self,
+        tokens_by_source: Mapping[CacheHitSource, int],
+        *,
+        preempted: bool = False,
+    ) -> None:
+        self._metrics.record_admission_hits(tokens_by_source, preempted=preempted)
 
     # -- sub-hash / block-id expansion ----------------------------------
 
@@ -799,6 +847,13 @@ class RaidenOffloadingManager(OffloadingManager):
                 return RaidenLoadStoreSpec(keys, pinned=False)
             idx = resolved_to
         self._pending_remote_slices.update(remote_slices)
+        self._metrics.record_prepared_load(
+            keys,
+            self._device_block_size_factor,
+            remote_slices,
+            sub_hashes,
+            self._block_status,
+        )
         return RaidenLoadStoreSpec(keys)
 
     def prepare_store(self, keys, req_context: ReqContext) -> PrepareStoreOutput | None:
@@ -903,6 +958,10 @@ class RaidenOffloadingManager(OffloadingManager):
         # read_remote. Drop the leftovers each step; a request retried
         # next step re-runs lookup() and repopulates the stash.
         self._remote_slices.clear()
+        self._metrics.on_schedule_end()
+
+    def get_stats(self) -> OffloadingConnectorStats | None:
+        return self._metrics.pop_stats()
 
     def reset_cache(self) -> None:
         # Backstop only: TPURaidenOffloadingConnector.reset_cache() reports
@@ -2404,6 +2463,12 @@ class TPURaidenStoreOffloadingSpec(OffloadingSpec):
     distributed registry settings.
     """
 
+    @classmethod
+    def build_metric_definitions(
+        cls, extra_config: dict[str, Any]
+    ) -> dict[str, OffloadingMetricMetadata]:
+        return build_raiden_offload_metric_definitions(extra_config)
+
     def __init__(
         self,
         config: OffloadingConfig,
@@ -2430,8 +2495,6 @@ class TPURaidenStoreOffloadingSpec(OffloadingSpec):
 
         # Ensure model-level hybrid flag and KV cache group specs agree before
         # resolving attention kernel geometry.
-        from vllm.v1.kv_cache_interface import MambaSpec
-
         self.is_hybrid_model = vllm_config.model_config.is_hybrid
         has_mamba_group = any(
             isinstance(g.kv_cache_spec, MambaSpec)
@@ -2649,6 +2712,12 @@ class TPURaidenStoreOffloadingSpec(OffloadingSpec):
                     ),
                     dict(storage.properties) or "none",
                 )
+            kv_cache_specs = {
+                group.group_id: self.kv_cache_config.kv_cache_groups[
+                    group.group_id
+                ].kv_cache_spec
+                for group in self.config.groups
+            }
             self._manager = RaidenOffloadingManager(
                 kernel_physical_blocks_capacity=self.kernel_physical_blocks_capacity,
                 offload_logical_blocks_capacity=self.offload_logical_blocks_capacity,
@@ -2662,6 +2731,16 @@ class TPURaidenStoreOffloadingSpec(OffloadingSpec):
                 key_namespace=self.key_namespace,
                 secondary_backend_configs=secondary_backend_configs,
                 dp_rank=self.dp_rank,
+                tokens_per_chunk_by_group={
+                    group.group_id: group.tokens_per_block * self.blocks_per_chunk
+                    for group in self.config.groups
+                },
+                mamba_group_ids={
+                    group_id
+                    for group_id, kv_cache_spec in kv_cache_specs.items()
+                    if isinstance(kv_cache_spec, MambaSpec)
+                },
+                storage_backend=storage.storage_type if storage is not None else None,
             )
         return self._manager
 
