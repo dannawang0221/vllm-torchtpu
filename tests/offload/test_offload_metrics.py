@@ -21,9 +21,11 @@ from typing import Any, cast
 
 import prometheus_client
 import pytest
+import torch
 from vllm.config import KVTransferConfig, VllmConfig
 from vllm.distributed.kv_transfer.kv_connector.v1.metrics import PromMetric
-from vllm.v1.kv_offload.base import make_offload_key
+from vllm.v1.kv_cache_interface import FullAttentionSpec, MambaSpec, SlidingWindowSpec
+from vllm.v1.kv_offload.base import ReqContext, make_offload_key
 from vllm.v1.kv_offload.factory import OffloadingSpecFactory
 from vllm.v1.metrics.cache_hit_source import CacheHitSource
 from vllm.v1.metrics.stats import SchedulerStats
@@ -33,6 +35,7 @@ from vllm_torchtpu.distributed.kv_transfer.tpu_multi_connector import TPUMultiCo
 from vllm_torchtpu.offload.metrics import (
     HOST_OFFLOAD_LABELS,
     OFFLOAD_LOAD_LABELNAMES,
+    OFFLOAD_SAVE_LABELNAMES,
     P2P_OFFLOAD_LABELS,
     UNSPECIFIED_OFFLOAD_LABELS,
     LoadTimingState,
@@ -40,7 +43,11 @@ from vllm_torchtpu.offload.metrics import (
     RaidenOffloadPromMetrics,
     RaidenOffloadStatsCollector,
     build_raiden_offload_metric_definitions,
+    compute_store_key_token_ranges,
+    count_merged_tokens,
     filter_positive_source_tokens,
+    saved_sub_block_ranges,
+    select_saved_tokens_group,
     split_external_hit,
     status_to_hit_source,
 )
@@ -100,8 +107,15 @@ def test_metric_definitions_have_directional_labels() -> None:
         RaidenOffloadMetricName.LOAD_OBSERVED_LATENCY,
         RaidenOffloadMetricName.FAILED_LOAD_JOBS,
     }
+    save_metrics = {
+        RaidenOffloadMetricName.SAVED_TOKENS,
+        RaidenOffloadMetricName.SAVE_OBSERVED_LATENCY,
+        RaidenOffloadMetricName.FAILED_SAVE_JOBS,
+    }
     for metric in load_metrics:
         assert defs[metric].labelnames == OFFLOAD_LOAD_LABELNAMES
+    for metric in save_metrics:
+        assert defs[metric].labelnames == OFFLOAD_SAVE_LABELNAMES
 
 
 @pytest.mark.parametrize(
@@ -399,6 +413,57 @@ def test_compute_load_tokens_by_source_sub_block_and_mamba() -> None:
     }
 
 
+def test_compute_store_key_token_ranges_and_merged_tokens() -> None:
+    req_ctx = ReqContext(req_id="r1")
+    attn_k0 = make_offload_key(b"a0", 0)
+    attn_k1 = make_offload_key(b"a1", 0)
+    tail_attn = make_offload_key(b"a_tail", 0)
+    mamba_k1 = make_offload_key(b"m1", 1)
+    unpositioned = make_offload_key(b"a_none", 0)
+
+    req_ctx.set_offload_key_position(attn_k0, 16)
+    req_ctx.set_offload_key_position(attn_k1, 32)
+    req_ctx.set_offload_key_position(tail_attn, 40)
+    req_ctx.set_offload_key_position(mamba_k1, 32)
+
+    # Only the counted group's keys get spans; the partial-tail key starts at
+    # its chunk boundary.
+    ranges = compute_store_key_token_ranges(
+        [attn_k0, attn_k1, tail_attn, mamba_k1, unpositioned],
+        req_ctx,
+        group_idx=0,
+        tokens_per_chunk=16,
+    )
+    assert ranges == {
+        attn_k0: (0, 16),
+        attn_k1: (16, 32),
+        tail_attn: (32, 40),
+    }
+    assert count_merged_tokens(ranges.values()) == 40
+    assert count_merged_tokens([(0, 16), (8, 24), (30, 32)]) == 26
+    assert count_merged_tokens([]) == 0
+
+
+def test_saved_sub_block_ranges() -> None:
+    # 16-token chunk, 4 sub-blocks of 4 tokens each.
+    assert saved_sub_block_ranges((0, 16), [True] * 4, 16, atomic=False) == [(0, 16)]
+    assert saved_sub_block_ranges((0, 16), [False] * 4, 16, atomic=False) == []
+    assert saved_sub_block_ranges(
+        (32, 48), [True, False, True, True], 16, atomic=False
+    ) == [(32, 36), (40, 48)]
+    # A partial-tail key clips its last saved sub-block to its end token.
+    assert saved_sub_block_ranges(
+        (32, 42), [False, False, True, True], 16, atomic=False
+    ) == [(40, 42)]
+    # Recurrent state and indivisible chunks are credited whole.
+    assert saved_sub_block_ranges(
+        (16, 32), [False, False, False, True], 16, atomic=True
+    ) == [(16, 32)]
+    assert saved_sub_block_ranges((0, 10), [False, True, False], 10, atomic=False) == [
+        (0, 10)
+    ]
+
+
 def test_split_external_hit_sums_to_hit_count() -> None:
     assert split_external_hit({CacheHitSource.HOST: 32}, 48) == {
         CacheHitSource.HOST: 32,
@@ -409,6 +474,29 @@ def test_split_external_hit_sums_to_hit_count() -> None:
     ) == {CacheHitSource.DISK: 8, CacheHitSource.EXTERNAL_UNSPECIFIED: 24}
     assert split_external_hit({CacheHitSource.P2P: 16}, 16) == {CacheHitSource.P2P: 16}
     assert split_external_hit({}, 16) == {CacheHitSource.EXTERNAL_UNSPECIFIED: 16}
+
+
+def test_select_saved_tokens_group() -> None:
+    attn = FullAttentionSpec(
+        block_size=16, num_kv_heads=1, head_size=8, dtype=torch.bfloat16
+    )
+    swa = SlidingWindowSpec(
+        block_size=16,
+        num_kv_heads=1,
+        head_size=8,
+        dtype=torch.bfloat16,
+        sliding_window=64,
+    )
+    mamba = MambaSpec(
+        block_size=16,
+        shapes=((2, 8),),
+        dtypes=(torch.bfloat16,),
+        mamba_cache_mode="align",
+    )
+    assert select_saved_tokens_group({0: swa, 1: attn, 2: mamba}) == 1
+    assert select_saved_tokens_group({0: mamba, 1: swa}) == 1
+    assert select_saved_tokens_group({3: mamba}) == 3
+    assert select_saved_tokens_group({}) is None
 
 
 def test_collector_load_lifecycle_staggered_sources_and_partial_failure() -> None:
@@ -562,6 +650,67 @@ def test_load_timing_blames_only_failed_or_in_flight_tiers() -> None:
     assert RaidenOffloadMetricName.LOAD_OBSERVED_LATENCY not in values
 
 
+def test_collector_save_lifecycle_dram_only_vs_storage() -> None:
+    clock = _FakeClock(50.0)
+    k0 = make_offload_key(b"k0", 0)
+    ranges = {k0: (0, 64)}
+
+    # DRAM-only save credits ("host", "dram") only.
+    dram_collector = RaidenOffloadStatsCollector(
+        storage_backend=None,
+        clock=clock,
+    )
+    save_timing = dram_collector.start_save_timing(
+        saved_token_ranges=ranges.values(),
+    )
+    clock.advance(0.005)
+    dram_collector.on_save_finalized(save_timing, success=True, now=clock())
+    dram_stats = dram_collector.pop_stats()
+    assert dram_stats is not None
+    dram_values = dram_stats.data["data"]
+    assert dram_values[RaidenOffloadMetricName.SAVED_TOKENS] == {
+        HOST_OFFLOAD_LABELS: 64
+    }
+    assert dram_values[RaidenOffloadMetricName.SAVE_OBSERVED_LATENCY] == {
+        HOST_OFFLOAD_LABELS: [pytest.approx(0.005)]
+    }
+
+    # Write-through storage save credits saved_tokens to both ("host", "dram")
+    # and ("disk", "posix"), and records save_observed_latency under ("disk", "posix").
+    storage_collector = RaidenOffloadStatsCollector(
+        storage_backend="posix",
+        clock=clock,
+    )
+    wt_timing = storage_collector.start_save_timing(
+        saved_token_ranges=ranges.values(),
+    )
+    clock.advance(0.025)
+    storage_collector.on_save_finalized(wt_timing, success=True, now=clock())
+    wt_stats = storage_collector.pop_stats()
+    assert wt_stats is not None
+    wt_values = wt_stats.data["data"]
+    assert wt_values[RaidenOffloadMetricName.SAVED_TOKENS] == {
+        HOST_OFFLOAD_LABELS: 64,
+        ("disk", "posix"): 64,
+    }
+    assert wt_values[RaidenOffloadMetricName.SAVE_OBSERVED_LATENCY] == {
+        ("disk", "posix"): [pytest.approx(0.025)]
+    }
+
+    # Failed save records failed_save_jobs on destination and 0 saved_tokens.
+    fail_timing = storage_collector.start_save_timing(
+        saved_token_ranges=ranges.values(),
+    )
+    storage_collector.on_save_finalized(fail_timing, success=False, now=clock())
+    fail_stats = storage_collector.pop_stats()
+    assert fail_stats is not None
+    fail_values = fail_stats.data["data"]
+    assert RaidenOffloadMetricName.SAVED_TOKENS not in fail_values
+    assert fail_values[RaidenOffloadMetricName.FAILED_SAVE_JOBS] == {
+        ("disk", "posix"): 1
+    }
+
+
 def test_prom_metrics_registration_and_end_to_end_observation() -> None:
     registry = prometheus_client.CollectorRegistry()
     extra = {"cpu_bytes_to_use": 1 << 20}
@@ -610,6 +759,12 @@ def test_prom_metrics_registration_and_end_to_end_observation() -> None:
     load_timing.on_sub_hash_done(b"s1", clock())
     collector.on_load_finalized(load_timing, success=True)
 
+    save_timing = collector.start_save_timing(
+        saved_token_ranges=[(0, 32)],
+    )
+    clock.advance(0.02)
+    collector.on_save_finalized(save_timing, success=True, now=clock())
+
     p2p_fail_timing = collector.start_load_timing(
         local_hashes=[],
         remote_hashes=[b"p_fail"],
@@ -619,6 +774,7 @@ def test_prom_metrics_registration_and_end_to_end_observation() -> None:
     )
     p2p_fail_timing.on_sub_hash_failed(b"p_fail")
     collector.on_load_finalized(p2p_fail_timing, success=False)
+    collector.record_failed_save(launched=True)
 
     raw_stats = collector.pop_stats()
     assert raw_stats is not None
@@ -633,6 +789,8 @@ def test_prom_metrics_registration_and_end_to_end_observation() -> None:
     base_labels = {"model_name": "test-model", "engine": "0"}
     disk_load_labels = {**base_labels, "source": "disk", "backend": "posix"}
     p2p_load_labels = {**base_labels, "source": "p2p", "backend": "rdma"}
+    host_save_labels = {**base_labels, "destination": "host", "backend": "dram"}
+    disk_save_labels = {**base_labels, "destination": "disk", "backend": "posix"}
 
     assert (
         registry.get_sample_value("vllm:kv_offload_hit_tokens_total", disk_load_labels)
@@ -641,6 +799,18 @@ def test_prom_metrics_registration_and_end_to_end_observation() -> None:
     assert (
         registry.get_sample_value(
             "vllm:kv_offload_loaded_tokens_total", disk_load_labels
+        )
+        == 32.0
+    )
+    assert (
+        registry.get_sample_value(
+            "vllm:kv_offload_saved_tokens_total", host_save_labels
+        )
+        == 32.0
+    )
+    assert (
+        registry.get_sample_value(
+            "vllm:kv_offload_saved_tokens_total", disk_save_labels
         )
         == 32.0
     )
@@ -655,7 +825,22 @@ def test_prom_metrics_registration_and_end_to_end_observation() -> None:
     ) == pytest.approx(0.05)
     assert (
         registry.get_sample_value(
+            "vllm:kv_offload_save_observed_latency_seconds_count", disk_save_labels
+        )
+        == 1.0
+    )
+    assert registry.get_sample_value(
+        "vllm:kv_offload_save_observed_latency_seconds_sum", disk_save_labels
+    ) == pytest.approx(0.02)
+    assert (
+        registry.get_sample_value(
             "vllm:kv_offload_failed_load_jobs_total", p2p_load_labels
+        )
+        == 1.0
+    )
+    assert (
+        registry.get_sample_value(
+            "vllm:kv_offload_failed_save_jobs_total", disk_save_labels
         )
         == 1.0
     )
@@ -710,6 +895,7 @@ def test_tpu_multi_connector_builds_and_observes_raiden_offload_prom_metrics() -
 
     collector = RaidenOffloadStatsCollector(storage_backend="posix")
     collector.record_admission_hits({CacheHitSource.DISK: 64})
+    collector.record_failed_save(launched=True)
     offload_stats = collector.pop_stats()
     assert offload_stats is not None
 
@@ -727,4 +913,11 @@ def test_tpu_multi_connector_builds_and_observes_raiden_offload_prom_metrics() -
             {"model_name": "disagg-model", "source": "disk", "backend": "posix"},
         )
         == 64.0
+    )
+    assert (
+        registry.get_sample_value(
+            "vllm:kv_offload_failed_save_jobs_total",
+            {"model_name": "disagg-model", "destination": "disk", "backend": "posix"},
+        )
+        == 1.0
     )
