@@ -33,7 +33,9 @@ from vllm_torchtpu.distributed.kv_transfer.tpu_multi_connector import TPUMultiCo
 from vllm_torchtpu.offload.metrics import (
     HOST_OFFLOAD_LABELS,
     OFFLOAD_LOAD_LABELNAMES,
+    P2P_OFFLOAD_LABELS,
     UNSPECIFIED_OFFLOAD_LABELS,
+    LoadTimingState,
     RaidenOffloadMetricName,
     RaidenOffloadPromMetrics,
     RaidenOffloadStatsCollector,
@@ -53,6 +55,17 @@ class _FakeBlockStatus(enum.Enum):
     HOST_AND_HBM = 4
     SHARED_STORAGE = 5
     CXL = 6
+
+
+class _FakeClock:
+    def __init__(self, initial: float = 100.0) -> None:
+        self.t = initial
+
+    def __call__(self) -> float:
+        return self.t
+
+    def advance(self, delta: float) -> None:
+        self.t += delta
 
 
 def _make_prom_metric_types(
@@ -83,6 +96,9 @@ def test_metric_definitions_have_directional_labels() -> None:
     assert set(defs.keys()) == {m.value for m in RaidenOffloadMetricName}
     load_metrics = {
         RaidenOffloadMetricName.HIT_TOKENS,
+        RaidenOffloadMetricName.LOADED_TOKENS,
+        RaidenOffloadMetricName.LOAD_OBSERVED_LATENCY,
+        RaidenOffloadMetricName.FAILED_LOAD_JOBS,
     }
     for metric in load_metrics:
         assert defs[metric].labelnames == OFFLOAD_LOAD_LABELNAMES
@@ -123,8 +139,10 @@ def test_filter_positive_source_tokens() -> None:
 
 
 def test_collector_unknown_sources_and_missing_key_handling() -> None:
+    clock = _FakeClock(5.0)
     collector = RaidenOffloadStatsCollector(
         storage_backend=None,
+        clock=clock,
     )
 
     # 1. Disk source without configured storage_backend uses ("disk", "unknown"),
@@ -154,8 +172,8 @@ def test_collector_unknown_sources_and_missing_key_handling() -> None:
     )
     assert collector.pop_stats() is None
 
-    # 3. Unrecognized BlockStatus (CXL) in prepare_load records under
-    # ("external_unspecified", "unknown") instead of ("p2p", "rdma").
+    # 3. Unrecognized BlockStatus (CXL) in prepare_load / start_load_timing
+    # records under ("external_unspecified", "unknown") instead of ("p2p", "rdma").
     k0 = make_offload_key(b"k0", 0)
     cxl_block = SimpleNamespace(status=_FakeBlockStatus.CXL)
     collector.record_prepared_load(
@@ -192,6 +210,18 @@ def test_collector_unknown_sources_and_missing_key_handling() -> None:
         CacheHitSource.EXTERNAL_UNSPECIFIED: 8,
     }
     collector.record_admission_hits(tokens_by_source)
+    timing = collector.start_load_timing(
+        local_hashes=[b"s0"],
+        remote_hashes=[b"s1"],
+        remote_slices=[cxl_block],
+        block_status_cls=_FakeBlockStatus,
+        tokens_by_source=tokens_by_source,
+    )
+    clock.advance(0.002)
+    timing.on_sub_hash_done(b"s0", clock())
+    clock.advance(0.007)
+    timing.on_sub_hash_done(b"s1", clock())
+    collector.on_load_finalized(timing, success=True)
 
     stats = collector.pop_stats()
     assert stats is not None
@@ -200,6 +230,42 @@ def test_collector_unknown_sources_and_missing_key_handling() -> None:
         HOST_OFFLOAD_LABELS: 8,
         UNSPECIFIED_OFFLOAD_LABELS: 8,
     }
+    assert values[RaidenOffloadMetricName.LOADED_TOKENS] == {
+        HOST_OFFLOAD_LABELS: 8,
+        UNSPECIFIED_OFFLOAD_LABELS: 8,
+    }
+    assert (
+        P2P_OFFLOAD_LABELS not in values[RaidenOffloadMetricName.LOAD_OBSERVED_LATENCY]
+    )
+    assert values[RaidenOffloadMetricName.LOAD_OBSERVED_LATENCY] == {
+        HOST_OFFLOAD_LABELS: [pytest.approx(0.002)],
+        UNSPECIFIED_OFFLOAD_LABELS: [pytest.approx(0.009)],
+    }
+
+    # 4. Failed transfer on an unrecognized BlockStatus records under
+    # ("external_unspecified", "unknown").
+    fail_timing = collector.start_load_timing(
+        local_hashes=[],
+        remote_hashes=[b"s2"],
+        remote_slices=[cxl_block],
+        block_status_cls=_FakeBlockStatus,
+        tokens_by_source={CacheHitSource.EXTERNAL_UNSPECIFIED: 16},
+    )
+    fail_timing.on_sub_hash_failed(b"s2")
+    collector.on_load_finalized(fail_timing, success=False)
+
+    fail_stats = collector.pop_stats()
+    assert fail_stats is not None
+    fail_values = fail_stats.data["data"]
+    assert fail_values[RaidenOffloadMetricName.FAILED_LOAD_JOBS] == {
+        UNSPECIFIED_OFFLOAD_LABELS: 1,
+    }
+    assert (
+        HOST_OFFLOAD_LABELS not in fail_values[RaidenOffloadMetricName.FAILED_LOAD_JOBS]
+    )
+    assert (
+        P2P_OFFLOAD_LABELS not in fail_values[RaidenOffloadMetricName.FAILED_LOAD_JOBS]
+    )
 
 
 def test_compute_load_tokens_by_source_sub_block_and_mamba() -> None:
@@ -345,6 +411,157 @@ def test_split_external_hit_sums_to_hit_count() -> None:
     assert split_external_hit({}, 16) == {CacheHitSource.EXTERNAL_UNSPECIFIED: 16}
 
 
+def test_collector_load_lifecycle_staggered_sources_and_partial_failure() -> None:
+    clock = _FakeClock(10.0)
+    collector = RaidenOffloadStatsCollector(
+        storage_backend="posix",
+        clock=clock,
+    )
+
+    # Preempted admission does not increment hit_tokens; initial admission does.
+    tokens = {
+        CacheHitSource.HOST: 16,
+        CacheHitSource.P2P: 32,
+        CacheHitSource.DISK: 48,
+    }
+    collector.record_admission_hits(tokens, preempted=True)
+    assert collector.pop_stats() is None
+
+    collector.record_admission_hits(tokens, preempted=False)
+    timing = collector.start_load_timing(
+        local_hashes=[b"h0", b"h1"],
+        remote_hashes=[b"p0", b"d0"],
+        remote_slices=[
+            SimpleNamespace(status=_FakeBlockStatus.REMOTE),
+            SimpleNamespace(status=_FakeBlockStatus.SHARED_STORAGE),
+        ],
+        block_status_cls=_FakeBlockStatus,
+        tokens_by_source=tokens,
+    )
+    clock.advance(0.002)
+    timing.on_sub_hash_done(b"h0", clock())
+    timing.on_sub_hash_done(b"h1", clock())
+    clock.advance(0.006)
+    timing.on_sub_hash_done(b"p0", clock())
+    clock.advance(0.032)
+    timing.on_sub_hash_done(b"d0", clock())
+    collector.on_load_finalized(timing, success=True)
+
+    stats = collector.pop_stats()
+    assert stats is not None
+    values = stats.data["data"]
+    assert values[RaidenOffloadMetricName.HIT_TOKENS] == {
+        HOST_OFFLOAD_LABELS: 16,
+        P2P_OFFLOAD_LABELS: 32,
+        ("disk", "posix"): 48,
+    }
+    assert values[RaidenOffloadMetricName.LOADED_TOKENS] == {
+        HOST_OFFLOAD_LABELS: 16,
+        P2P_OFFLOAD_LABELS: 32,
+        ("disk", "posix"): 48,
+    }
+    assert values[RaidenOffloadMetricName.LOAD_OBSERVED_LATENCY][
+        HOST_OFFLOAD_LABELS
+    ] == [pytest.approx(0.002)]
+    assert values[RaidenOffloadMetricName.LOAD_OBSERVED_LATENCY][
+        P2P_OFFLOAD_LABELS
+    ] == [pytest.approx(0.008)]
+    assert values[RaidenOffloadMetricName.LOAD_OBSERVED_LATENCY][("disk", "posix")] == [
+        pytest.approx(0.04)
+    ]
+
+    # Partial failure: host finishes cleanly, disk fails -> host latency kept,
+    # zero loaded_tokens, and failed_load_jobs incremented only for ("disk", "posix").
+    fail_timing = collector.start_load_timing(
+        local_hashes=[b"h2"],
+        remote_hashes=[b"d2"],
+        remote_slices=[SimpleNamespace(status=_FakeBlockStatus.SHARED_STORAGE)],
+        block_status_cls=_FakeBlockStatus,
+        tokens_by_source={CacheHitSource.HOST: 16, CacheHitSource.DISK: 16},
+    )
+    clock.advance(0.003)
+    fail_timing.on_sub_hash_done(b"h2", clock())
+    clock.advance(0.010)
+    fail_timing.on_sub_hash_failed(b"d2")
+    collector.on_load_finalized(fail_timing, success=False)
+
+    fail_stats = collector.pop_stats()
+    assert fail_stats is not None
+    fail_values = fail_stats.data["data"]
+    assert RaidenOffloadMetricName.LOADED_TOKENS not in fail_values
+    assert fail_values[RaidenOffloadMetricName.FAILED_LOAD_JOBS] == {
+        ("disk", "posix"): 1
+    }
+    assert fail_values[RaidenOffloadMetricName.LOAD_OBSERVED_LATENCY] == {
+        HOST_OFFLOAD_LABELS: [pytest.approx(0.003)]
+    }
+
+
+def test_load_timing_blames_only_failed_or_in_flight_tiers() -> None:
+    collector = RaidenOffloadStatsCollector(storage_backend="posix")
+
+    def start() -> LoadTimingState:
+        return collector.start_load_timing(
+            local_hashes=[b"h0"],
+            remote_hashes=[b"d0"],
+            remote_slices=[SimpleNamespace(status=_FakeBlockStatus.SHARED_STORAGE)],
+            block_status_cls=_FakeBlockStatus,
+        )
+
+    def finalize_failed(
+        timing: LoadTimingState, *, poisoned: bool = False
+    ) -> dict[str, Any]:
+        collector.on_load_finalized(timing, success=False, poisoned=poisoned)
+        stats = collector.pop_stats()
+        assert stats is not None
+        return stats.data["data"]
+
+    # store.load() refused: read_remote() never launched, so disk is not blamed.
+    timing = start()
+    timing.mark_local_launch_failed()
+    assert finalize_failed(timing)[RaidenOffloadMetricName.FAILED_LOAD_JOBS] == {
+        HOST_OFFLOAD_LABELS: 1
+    }
+
+    timing = start()
+    timing.mark_remote_launch_failed([b"d0"])
+    assert finalize_failed(timing)[RaidenOffloadMetricName.FAILED_LOAD_JOBS] == {
+        ("disk", "posix"): 1
+    }
+
+    # A later read_remote() batch refused while the first (one peer plus the
+    # storage reads) is in flight: only the never-launched batch's tier is
+    # blamed, and the storage tier still records its latency.
+    timing = collector.start_load_timing(
+        local_hashes=[],
+        remote_hashes=[b"p0", b"d0", b"p1"],
+        remote_slices=[
+            SimpleNamespace(status=_FakeBlockStatus.REMOTE),
+            SimpleNamespace(status=_FakeBlockStatus.SHARED_STORAGE),
+            SimpleNamespace(status=_FakeBlockStatus.REMOTE),
+        ],
+        block_status_cls=_FakeBlockStatus,
+    )
+    timing.mark_remote_launch_failed([b"p1"])
+    timing.on_sub_hash_done(b"p0", 1.0)
+    timing.on_sub_hash_done(b"d0", 1.0)
+    values = finalize_failed(timing)
+    assert values[RaidenOffloadMetricName.FAILED_LOAD_JOBS] == {("p2p", "rdma"): 1}
+    assert set(values[RaidenOffloadMetricName.LOAD_OBSERVED_LATENCY]) == {
+        ("disk", "posix")
+    }
+
+    # Poisoned after the host tier landed: only the in-flight disk tier is
+    # blamed, and a poisoned job records no latency.
+    timing = start()
+    timing.on_sub_hash_done(b"h0", 1.0)
+    timing.mark_poisoned()
+    timing.on_sub_hash_done(b"d0", 2.0)
+    values = finalize_failed(timing, poisoned=True)
+    assert values[RaidenOffloadMetricName.FAILED_LOAD_JOBS] == {("disk", "posix"): 1}
+    assert RaidenOffloadMetricName.LOAD_OBSERVED_LATENCY not in values
+
+
 def test_prom_metrics_registration_and_end_to_end_observation() -> None:
     registry = prometheus_client.CollectorRegistry()
     extra = {"cpu_bytes_to_use": 1 << 20}
@@ -372,10 +589,36 @@ def test_prom_metrics_registration_and_end_to_end_observation() -> None:
     assert "spec_module_path" not in kv_transfer_config.kv_connector_extra_config
     assert "TPURaidenStoreOffloadingSpec" not in OffloadingSpecFactory._registry
 
+    clock = _FakeClock(1.0)
     collector = RaidenOffloadStatsCollector(
         storage_backend="posix",
+        clock=clock,
     )
     collector.record_admission_hits({CacheHitSource.DISK: 32})
+    load_timing = collector.start_load_timing(
+        local_hashes=[],
+        remote_hashes=[b"s0", b"s1"],
+        remote_slices=[
+            SimpleNamespace(status=_FakeBlockStatus.SHARED_STORAGE),
+            SimpleNamespace(status=_FakeBlockStatus.SHARED_STORAGE),
+        ],
+        block_status_cls=_FakeBlockStatus,
+        tokens_by_source={CacheHitSource.DISK: 32},
+    )
+    clock.advance(0.05)
+    load_timing.on_sub_hash_done(b"s0", clock())
+    load_timing.on_sub_hash_done(b"s1", clock())
+    collector.on_load_finalized(load_timing, success=True)
+
+    p2p_fail_timing = collector.start_load_timing(
+        local_hashes=[],
+        remote_hashes=[b"p_fail"],
+        remote_slices=[SimpleNamespace(status=_FakeBlockStatus.REMOTE)],
+        block_status_cls=_FakeBlockStatus,
+        tokens_by_source={CacheHitSource.P2P: 16},
+    )
+    p2p_fail_timing.on_sub_hash_failed(b"p_fail")
+    collector.on_load_finalized(p2p_fail_timing, success=False)
 
     raw_stats = collector.pop_stats()
     assert raw_stats is not None
@@ -389,10 +632,32 @@ def test_prom_metrics_registration_and_end_to_end_observation() -> None:
 
     base_labels = {"model_name": "test-model", "engine": "0"}
     disk_load_labels = {**base_labels, "source": "disk", "backend": "posix"}
+    p2p_load_labels = {**base_labels, "source": "p2p", "backend": "rdma"}
 
     assert (
         registry.get_sample_value("vllm:kv_offload_hit_tokens_total", disk_load_labels)
         == 32.0
+    )
+    assert (
+        registry.get_sample_value(
+            "vllm:kv_offload_loaded_tokens_total", disk_load_labels
+        )
+        == 32.0
+    )
+    assert (
+        registry.get_sample_value(
+            "vllm:kv_offload_load_observed_latency_seconds_count", disk_load_labels
+        )
+        == 1.0
+    )
+    assert registry.get_sample_value(
+        "vllm:kv_offload_load_observed_latency_seconds_sum", disk_load_labels
+    ) == pytest.approx(0.05)
+    assert (
+        registry.get_sample_value(
+            "vllm:kv_offload_failed_load_jobs_total", p2p_load_labels
+        )
+        == 1.0
     )
     # Deprecated CPUOffloadingSpec metric stays at its initial 0.0 value.
     assert (
