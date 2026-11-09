@@ -203,6 +203,7 @@ class _ParkedStore:
     keys: list[OffloadKey]
     device_block_ids: list[int]
     acks: int = 0
+    key_token_ranges: dict[OffloadKey, tuple[int, int]] = field(default_factory=dict)
 
 
 class TPURaidenOffloadingScheduler(OffloadingConnectorScheduler):
@@ -298,7 +299,9 @@ class TPURaidenOffloadingScheduler(OffloadingConnectorScheduler):
                 len(dst_spec.keys),
             )
             self._fence_pending[job_id] = _ParkedStore(
-                keys=dst_spec.keys, device_block_ids=device_block_ids
+                keys=dst_spec.keys,
+                device_block_ids=device_block_ids,
+                key_token_ranges=dst_spec.key_token_ranges,
             )
             new_fence_ids.add(job_id)
 
@@ -382,7 +385,10 @@ class TPURaidenOffloadingScheduler(OffloadingConnectorScheduler):
                 if parked.acks == self.config.num_workers:
                     del self._fence_pending[job_id]
                     self._raiden_manager.submit_store_job(
-                        job_id, parked.keys, parked.device_block_ids
+                        job_id,
+                        parked.keys,
+                        parked.device_block_ids,
+                        key_token_ranges=parked.key_token_ranges,
                     )
         super().update_connector_output(connector_output)
 
