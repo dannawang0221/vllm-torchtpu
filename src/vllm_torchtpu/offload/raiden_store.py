@@ -84,7 +84,7 @@ import socket
 import threading
 import time
 from collections import defaultdict
-from collections.abc import Iterable, Mapping, Sequence
+from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, cast
 
@@ -127,6 +127,7 @@ from vllm_torchtpu.offload.block_major_layout import (
 from vllm_torchtpu.offload.metrics import (
     HOST_OFFLOAD_LABELS,
     P2P_OFFLOAD_LABELS,
+    LoadTimingState,
     RaidenOffloadStatsCollector,
     build_raiden_offload_metric_definitions,
 )
@@ -312,6 +313,7 @@ class Admission:
     # retry exactly this subset), and launch failures pre-fill the batch.
     failed_sub_hashes: list[bytes] = field(default_factory=list)
     retries_left: int = 0
+    load_timing: LoadTimingState | None = None
 
 
 @dataclass
@@ -373,6 +375,7 @@ class RaidenOffloadingManager(OffloadingManager):
         tokens_per_chunk_by_group: Mapping[int, int] | None = None,
         mamba_group_ids: Iterable[int] = (),
         storage_backend: str | None = None,
+        metrics_clock: Callable[[], float] | None = None,
         # Test overrides: allow injecting mock store instance and type bindings.
         store: Any = None,
         store_types: Any = None,
@@ -529,7 +532,10 @@ class RaidenOffloadingManager(OffloadingManager):
             dict(tokens_per_chunk_by_group) if tokens_per_chunk_by_group else {}
         )
         self._mamba_group_ids: frozenset[int] = frozenset(mamba_group_ids)
-        self._metrics = RaidenOffloadStatsCollector(storage_backend=storage_backend)
+        self._metrics = RaidenOffloadStatsCollector(
+            storage_backend=storage_backend,
+            clock=metrics_clock,
+        )
 
     def compute_load_tokens_by_source(
         self,
@@ -1115,12 +1121,15 @@ class RaidenOffloadingManager(OffloadingManager):
         device_block_ids: list[int],
         req_id: str,
         pinned: bool = True,
+        *,
+        tokens_by_source: Mapping[CacheHitSource, int] | None = None,
     ) -> None:
         """Launch a load job; entries were pinned in prepare_load."""
         assert len(keys) == len(device_block_ids), (len(keys), len(device_block_ids))
         if not pinned:
-            # prepare_load lost the pin race; nothing is held, so fail the
-            # job without touching the store and let vLLM recompute.
+            # prepare_load lost the pin race before any transfer launched;
+            # nothing is held, so signal recompute to vLLM without touching
+            # the store or recording a failed transfer job.
             self._finished.append(
                 FinishedJob(
                     job_id=job_id,
@@ -1166,6 +1175,14 @@ class RaidenOffloadingManager(OffloadingManager):
                 remote_batches.append(storage_batch)
         remote_hashes = [h for batch in remote_batches for h in batch.hashes]
 
+        load_timing = self._metrics.start_load_timing(
+            local_hashes=local_hashes,
+            remote_hashes=remote_hashes,
+            remote_slices=[block for batch in remote_batches for block in batch.slices],
+            block_status_cls=self._block_status,
+            tokens_by_source=tokens_by_source,
+        )
+
         def _fail_launch(
             what: str, failed_hashes: list[bytes], in_flight: list[bytes]
         ) -> None:
@@ -1190,6 +1207,7 @@ class RaidenOffloadingManager(OffloadingManager):
                 dst_device_block_ids=list(device_block_ids),
                 remote_sub_hashes=set(remote_hashes),
                 failed_sub_hashes=list(failed_hashes),
+                load_timing=load_timing,
             )
             if in_flight:
                 # Earlier launches succeeded: the job must stay non-terminal
@@ -1211,6 +1229,7 @@ class RaidenOffloadingManager(OffloadingManager):
         if local_hashes and not self._store.load(
             local_hashes, dst_device_ids_for_local
         ):
+            load_timing.mark_local_launch_failed()
             _fail_launch("load()", local_hashes, [])
             return
         in_flight = list(local_hashes)
@@ -1219,11 +1238,9 @@ class RaidenOffloadingManager(OffloadingManager):
                 batch.hashes, batch.slices, batch.device_ids
             ):
                 launched = set(in_flight)
-                _fail_launch(
-                    "read_remote()",
-                    [h for h in remote_hashes if h not in launched],
-                    in_flight,
-                )
+                not_launched = [h for h in remote_hashes if h not in launched]
+                load_timing.mark_remote_launch_failed(not_launched)
+                _fail_launch("read_remote()", not_launched, in_flight)
                 return
             in_flight.extend(batch.hashes)
         admission = Admission(
@@ -1235,6 +1252,7 @@ class RaidenOffloadingManager(OffloadingManager):
             req_id=req_id,
             dst_device_block_ids=list(device_block_ids),
             remote_sub_hashes=set(remote_hashes),
+            load_timing=load_timing,
         )
         self._admissions[job_id] = admission
         for sub_hash in sub_hashes:
@@ -1276,6 +1294,12 @@ class RaidenOffloadingManager(OffloadingManager):
         else:
             if admission.failed:
                 self._mark_unloadable(admission)
+            assert admission.load_timing is not None
+            self._metrics.on_load_finalized(
+                admission.load_timing,
+                success=success,
+                poisoned=admission.poisoned,
+            )
             self._finished.append(
                 FinishedJob(
                     job_id=admission.job_id,
@@ -1392,11 +1416,15 @@ class RaidenOffloadingManager(OffloadingManager):
         # Keyed by job_id: a mixed batch whose last hashes resolve in the
         # same poll (some done, some failed) must finalize exactly once.
         newly_terminal: dict[int, Admission] = {}
+        now = self._metrics.now()
         for done, failed in results:
             for sub_hash in failed:
                 admission = self._hash_to_admission.get(sub_hash)
                 if admission is None:
                     continue
+                timing = admission.load_timing
+                if timing is not None and sub_hash in admission.pending:
+                    timing.on_sub_hash_failed(sub_hash)
                 admission.failed = True
                 admission.failed_sub_hashes.append(sub_hash)
                 admission.pending.discard(sub_hash)
@@ -1406,6 +1434,9 @@ class RaidenOffloadingManager(OffloadingManager):
                 admission = self._hash_to_admission.get(sub_hash)
                 if admission is None:
                     continue
+                timing = admission.load_timing
+                if timing is not None and sub_hash in admission.pending:
+                    timing.on_sub_hash_done(sub_hash, now)
                 if sub_hash not in admission.remote_sub_hashes:
                     # A save or a local load that landed spends the pin the
                     # job was holding for that sub-hash.
@@ -1502,7 +1533,10 @@ class RaidenOffloadingManager(OffloadingManager):
                 return drained
             if time.perf_counter() >= deadline:
                 for job_id in live:
-                    self._admissions[job_id].poisoned = True
+                    admission = self._admissions[job_id]
+                    admission.poisoned = True
+                    if admission.load_timing is not None:
+                        admission.load_timing.mark_poisoned()
                 logger.error(
                     "TPURaidenOffloadingConnector: drain timed out after %.1fs; "
                     "poisoned jobs %s (%d keys): their transfers are still in flight "

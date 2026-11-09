@@ -4372,6 +4372,17 @@ class TestDenseDpIndex(unittest.TestCase):
         self.assertEqual(job_name, "vllm-offload-engine-dp2")
 
 
+class _ManualClock:
+    def __init__(self, initial: float = 10.0) -> None:
+        self.t = initial
+
+    def __call__(self) -> float:
+        return self.t
+
+    def advance(self, delta: float) -> None:
+        self.t += delta
+
+
 def _make_real_scheduler(
     manager,
     *,
@@ -4617,8 +4628,9 @@ class TestHitSourcesBySource(unittest.TestCase):
         _ = sched.get_stats()
 
         # Simulate host eviction + request preemption and re-admission from
-        # shared storage: get_external_cache_hit_sources still reports DISK,
-        # while HIT_TOKENS is not incremented again.
+        # shared storage: get_external_cache_hit_sources still reports DISK and
+        # LOADED_TOKENS still counts the physical reload, while HIT_TOKENS is
+        # not incremented again.
         store.entries.clear()
         sched2 = _make_real_scheduler(manager, block_size=self.BLOCK, hybrid=True)
         req2 = _make_hashed_request("req2", 3 * self.BLOCK + 1, self.BLOCK)
@@ -4638,6 +4650,17 @@ class TestHitSourcesBySource(unittest.TestCase):
         assert stats2 is not None
         self.assertNotIn(RaidenOffloadMetricName.HIT_TOKENS, stats2.data["data"])
         self.assertIsNone(manager.get_stats())
+        for key in (k_attn0, k_attn1, k_mamba1):
+            store.complete_remote_read(sub_hashes(key))
+        (reload_finished,) = manager.poll_finished_jobs()
+        self.assertTrue(reload_finished.success)
+        reload_stats = sched2.get_stats()
+        assert reload_stats is not None
+        self.assertNotIn(RaidenOffloadMetricName.HIT_TOKENS, reload_stats.data["data"])
+        self.assertEqual(
+            reload_stats.data["data"][RaidenOffloadMetricName.LOADED_TOKENS],
+            {("disk", "posix"): 2 * self.BLOCK},
+        )
 
     def test_unknown_source_and_missing_key_cache_semantics(self):
         from vllm.v1.core.kv_cache_manager import KVCacheBlocks
@@ -4663,7 +4686,7 @@ class TestHitSourcesBySource(unittest.TestCase):
         self.assertEqual(ext_tokens, self.BLOCK)
 
         # 1. Simulate a key missing _step_key_sources during update_state_after_alloc:
-        # Raiden's HIT_TOKENS skips unrecorded keys rather than
+        # Raiden's HIT_TOKENS / LOADED_TOKENS skip unrecorded keys rather than
         # mislabeling them, while get_external_cache_hit_sources still sums to the
         # hit count (as external_unspecified), so upstream keeps the split.
         manager._metrics._step_key_sources.clear()
@@ -4692,11 +4715,12 @@ class TestHitSourcesBySource(unittest.TestCase):
         assert miss_stats is not None
         miss_values = miss_stats.data["data"]
         self.assertNotIn(RaidenOffloadMetricName.HIT_TOKENS, miss_values)
+        self.assertNotIn(RaidenOffloadMetricName.LOADED_TOKENS, miss_values)
 
         # 2. A genuinely unrecognized BlockStatus (e.g. a new C++ tier not yet
         # mapped by Python's _block_status) records under
-        # UNSPECIFIED_OFFLOAD_LABELS == ("external_unspecified", "unknown") in
-        # hit_tokens.
+        # UNSPECIFIED_OFFLOAD_LABELS == ("external_unspecified", "unknown") across
+        # hit, loaded, latency, and failed_load_jobs metrics.
         self.assertEqual(
             UNSPECIFIED_OFFLOAD_LABELS, ("external_unspecified", "unknown")
         )
@@ -4731,6 +4755,35 @@ class TestHitSourcesBySource(unittest.TestCase):
                 cxl_tokens, {CacheHitSource.EXTERNAL_UNSPECIFIED: self.BLOCK}
             )
             manager.record_admission_hits(cxl_tokens)
+            manager._pending_remote_slices.update(
+                {sh: unknown_block for sh in sub_hashes(k_cxl_ok)}
+            )
+            manager.submit_load_job(
+                98,
+                [k_cxl_ok],
+                [19],
+                "cxl_ok_req",
+                tokens_by_source=cxl_tokens,
+            )
+            store.complete_remote_read(sub_hashes(k_cxl_ok))
+            (cxl_ok_finished,) = manager.poll_finished_jobs()
+            self.assertTrue(cxl_ok_finished.success)
+
+            k_bad_status = _key(99)
+            manager._pending_remote_slices.update(
+                {sh: unknown_block for sh in sub_hashes(k_bad_status)}
+            )
+            store.fail_read_remote = True
+            manager.submit_load_job(
+                99,
+                [k_bad_status],
+                [20],
+                "bad_status_req",
+                tokens_by_source={CacheHitSource.EXTERNAL_UNSPECIFIED: self.BLOCK},
+            )
+            store.fail_read_remote = False
+            (bad_finished,) = manager.poll_finished_jobs()
+            self.assertFalse(bad_finished.success)
 
         unk_stats = sched.get_stats()
         assert unk_stats is not None
@@ -4738,6 +4791,18 @@ class TestHitSourcesBySource(unittest.TestCase):
         self.assertEqual(
             unk_values[RaidenOffloadMetricName.HIT_TOKENS],
             {UNSPECIFIED_OFFLOAD_LABELS: self.BLOCK},
+        )
+        self.assertEqual(
+            unk_values[RaidenOffloadMetricName.LOADED_TOKENS],
+            {UNSPECIFIED_OFFLOAD_LABELS: self.BLOCK},
+        )
+        self.assertEqual(
+            set(unk_values[RaidenOffloadMetricName.LOAD_OBSERVED_LATENCY].keys()),
+            {UNSPECIFIED_OFFLOAD_LABELS},
+        )
+        self.assertEqual(
+            unk_values[RaidenOffloadMetricName.FAILED_LOAD_JOBS],
+            {UNSPECIFIED_OFFLOAD_LABELS: 1},
         )
 
     def test_unpinned_load_reports_unspecified_and_no_hit_tokens(self):
@@ -4852,11 +4917,13 @@ class TestHitSourcesBySource(unittest.TestCase):
 
         from vllm_torchtpu.offload.metrics import RaidenOffloadMetricName
 
+        clock = _ManualClock(50.0)
         store = FakeKVCacheStore()
         manager = make_global_manager(
             store,
             tokens_per_chunk_by_group={0: self.BLOCK},
             storage_backend="posix",
+            metrics_clock=clock,
         )
         sched = _make_real_scheduler(manager, block_size=self.BLOCK)
         req = _make_hashed_request("mixed_sub_req", 2 * self.BLOCK + 1, self.BLOCK)
@@ -4904,6 +4971,283 @@ class TestHitSourcesBySource(unittest.TestCase):
                 ("disk", "posix"): 4,
             },
         )
+
+        clock.advance(0.002)
+        store.complete_load([s0, s1])
+        clock.advance(0.006)
+        store.complete_remote_read([s2])
+        clock.advance(0.022)
+        store.complete_remote_read([s3])
+        (finished,) = manager.poll_finished_jobs()
+        self.assertTrue(finished.success)
+
+        load_stats = sched.get_stats()
+        assert load_stats is not None
+        load_values = load_stats.data["data"]
+        self.assertEqual(
+            load_values[RaidenOffloadMetricName.LOADED_TOKENS],
+            {
+                ("host", "dram"): 8,
+                ("p2p", "rdma"): 4,
+                ("disk", "posix"): 4,
+            },
+        )
+        self.assertEqual(
+            set(load_values[RaidenOffloadMetricName.LOAD_OBSERVED_LATENCY].keys()),
+            {("host", "dram"), ("p2p", "rdma"), ("disk", "posix")},
+        )
+
+
+class TestLoadMetricsBySource(unittest.TestCase):
+    """Per-source load latency, loaded tokens, and failure counters."""
+
+    BLOCK = 16
+
+    def test_staggered_multi_source_load_latency_and_loaded_tokens(self):
+        from vllm.v1.core.kv_cache_manager import KVCacheBlocks
+        from vllm.v1.core.kv_cache_utils import KVCacheBlock
+        from vllm.v1.core.sched.output import SchedulerOutput
+
+        from vllm_torchtpu.offload.metrics import RaidenOffloadMetricName
+
+        clock = _ManualClock(100.0)
+        store = FakeKVCacheStore()
+        manager = make_global_manager(
+            store,
+            storage_backend="posix",
+            metrics_clock=clock,
+        )
+        sched = _make_real_scheduler(manager, block_size=self.BLOCK)
+        req = _make_hashed_request("req", 4 * self.BLOCK + 1, self.BLOCK)
+        sched.on_new_request(req)
+
+        k0 = make_offload_key(req.block_hashes[0], 0)
+        k1 = make_offload_key(req.block_hashes[1], 0)
+        k2 = make_offload_key(req.block_hashes[2], 0)
+        seed_host_entries(store, k0)
+        seed_global_entries(store, k1)
+        seed_storage_entries(store, k2)
+
+        ext_tokens, _ = sched.get_num_new_matched_tokens(req, 0)
+        self.assertEqual(ext_tokens, 3 * self.BLOCK)
+        blocks = [KVCacheBlock(10), KVCacheBlock(11), KVCacheBlock(12)]
+        sched.update_state_after_alloc(req, KVCacheBlocks(blocks=(blocks,)), ext_tokens)
+
+        empty_sched_out = SchedulerOutput.make_empty()
+        sched.build_connector_meta(empty_sched_out)
+        # Drain admission hit_tokens right after build_connector_meta.
+        _ = sched.get_stats()
+
+        # Host finishes at +1.5ms, P2P at +8ms, Disk at +45ms.
+        clock.advance(0.0015)
+        store.complete_load(sub_hashes(k0))
+        self.assertEqual(manager.poll_finished_jobs(), [])
+
+        clock.advance(0.0065)
+        store.complete_remote_read(sub_hashes(k1))
+        self.assertEqual(manager.poll_finished_jobs(), [])
+
+        clock.advance(0.037)
+        store.complete_remote_read(sub_hashes(k2))
+        (finished,) = manager.poll_finished_jobs()
+        self.assertTrue(finished.success)
+
+        stats = sched.get_stats()
+        assert stats is not None
+        values = stats.data["data"]
+        self.assertEqual(
+            values[RaidenOffloadMetricName.LOADED_TOKENS],
+            {
+                ("host", "dram"): self.BLOCK,
+                ("p2p", "rdma"): self.BLOCK,
+                ("disk", "posix"): self.BLOCK,
+            },
+        )
+        self.assertAlmostEqual(
+            values[RaidenOffloadMetricName.LOAD_OBSERVED_LATENCY][("host", "dram")][0],
+            0.0015,
+        )
+        self.assertAlmostEqual(
+            values[RaidenOffloadMetricName.LOAD_OBSERVED_LATENCY][("p2p", "rdma")][0],
+            0.008,
+        )
+        self.assertAlmostEqual(
+            values[RaidenOffloadMetricName.LOAD_OBSERVED_LATENCY][("disk", "posix")][0],
+            0.045,
+        )
+
+    def test_load_failure_modes_and_unpinned_eviction_boundary(self):
+        from vllm.v1.core.kv_cache_manager import KVCacheBlocks
+        from vllm.v1.core.kv_cache_utils import KVCacheBlock
+        from vllm.v1.core.sched.output import SchedulerOutput
+        from vllm.v1.metrics.cache_hit_source import CacheHitSource
+
+        from vllm_torchtpu.offload import raiden_store as rs
+        from vllm_torchtpu.offload.metrics import RaidenOffloadMetricName
+
+        # 1. Eviction before prepare_load pins (pinned=False): belongs to the
+        # cache_hit pin gate, so HIT_TOKENS and FAILED_LOAD_JOBS report 0
+        # confirmed hit tokens, while FinishedJob(success=False) triggers vLLM
+        # recompute. Upstream already counted the tokens as hits, so
+        # get_external_cache_hit_sources reports them as external_unspecified.
+        store = FakeKVCacheStore()
+        clock = _ManualClock(1.0)
+        manager = make_global_manager(
+            store,
+            storage_backend="posix",
+            metrics_clock=clock,
+        )
+        sched = _make_real_scheduler(manager, block_size=self.BLOCK)
+        req = _make_hashed_request("evict_req", 2 * self.BLOCK + 1, self.BLOCK)
+        sched.on_new_request(req)
+        k0 = make_offload_key(req.block_hashes[0], 0)
+        seed_host_entries(store, k0)
+        ext_tokens, _ = sched.get_num_new_matched_tokens(req, 0)
+        self.assertEqual(ext_tokens, self.BLOCK)
+
+        # Evict k0 from host DRAM before prepare_load runs in update_state_after_alloc.
+        store.entries.clear()
+        sched.update_state_after_alloc(
+            req,
+            KVCacheBlocks(blocks=([KVCacheBlock(10), KVCacheBlock(11)],)),
+            ext_tokens,
+        )
+        self.assertEqual(
+            sched.get_external_cache_hit_sources(req, ext_tokens),
+            {CacheHitSource.EXTERNAL_UNSPECIFIED: self.BLOCK},
+        )
+        meta = sched.build_connector_meta(SchedulerOutput.make_empty())
+        self.assertEqual(meta.failed_load_req_ids, {"evict_req"})
+        self.assertIsNone(manager.get_stats())
+        evict_stats = sched.get_stats()
+        assert evict_stats is not None
+        for metric_name in RaidenOffloadMetricName:
+            self.assertNotIn(metric_name, evict_stats.data["data"])
+
+        # 2. Synchronous read_remote() launch failure while local load() is in flight.
+        k_host = _key(1)
+        k_peer = _key(2)
+        seed_host_entries(store, k_host)
+        seed_global_entries(store, k_peer)
+        self.assertEqual(manager.lookup(k_host, _ctx("r2")), LookupResult.HIT)
+        self.assertEqual(manager.lookup(k_peer, _ctx("r2")), LookupResult.HIT)
+        manager.prepare_load([k_host, k_peer], _ctx("r2"))
+        store.fail_read_remote = True
+        manager.submit_load_job(
+            2,
+            [k_host, k_peer],
+            [11, 12],
+            "r2",
+            tokens_by_source={CacheHitSource.HOST: 16, CacheHitSource.P2P: 16},
+        )
+        store.fail_read_remote = False
+        clock.advance(0.002)
+        store.complete_load(sub_hashes(k_host))
+        (finished,) = manager.poll_finished_jobs()
+        self.assertFalse(finished.success)
+        stats = manager.get_stats()
+        assert stats is not None
+        values = stats.data["data"]
+        self.assertEqual(
+            values[RaidenOffloadMetricName.FAILED_LOAD_JOBS],
+            {("p2p", "rdma"): 1},
+        )
+        self.assertAlmostEqual(
+            values[RaidenOffloadMetricName.LOAD_OBSERVED_LATENCY][("host", "dram")][0],
+            0.002,
+        )
+        self.assertNotIn(RaidenOffloadMetricName.LOADED_TOKENS, values)
+
+        # 3. Drain timeout poisons in-flight load -> suppresses latency, counts failure.
+        k_slow = _key(3)
+        seed_host_entries(store, k_slow)
+        manager.prepare_load([k_slow], _ctx("r3"))
+        manager.submit_load_job(
+            3, [k_slow], [13], "r3", tokens_by_source={CacheHitSource.HOST: 16}
+        )
+        with patch.object(rs, "_DRAIN_TIMEOUT_S", 0.0):
+            manager.drain_jobs({3})
+        clock.advance(0.01)
+        store.complete_load(sub_hashes(k_slow))
+        (poisoned_job,) = manager.poll_finished_jobs()
+        self.assertFalse(poisoned_job.success)
+        stats = manager.get_stats()
+        assert stats is not None
+        values = stats.data["data"]
+        self.assertEqual(
+            values[RaidenOffloadMetricName.FAILED_LOAD_JOBS],
+            {("host", "dram"): 1},
+        )
+        self.assertNotIn(RaidenOffloadMetricName.LOAD_OBSERVED_LATENCY, values)
+
+    def test_poisoned_load_blames_only_tiers_still_in_flight(self):
+        from vllm.v1.metrics.cache_hit_source import CacheHitSource
+
+        from vllm_torchtpu.offload import raiden_store as rs
+        from vllm_torchtpu.offload.metrics import RaidenOffloadMetricName
+
+        store = FakeKVCacheStore()
+        manager = make_manager(store, storage_backend="posix")
+        k_host, k_disk = _key(1), _key(2)
+        seed_host_entries(store, k_host)
+        seed_storage_entries(store, k_disk)
+        ctx = _ctx("r")
+        manager.on_new_request(ctx)
+        self.assertEqual(manager.lookup(k_host, ctx), LookupResult.HIT)
+        self.assertEqual(manager.lookup(k_disk, ctx), LookupResult.HIT)
+        manager.prepare_load([k_host, k_disk], ctx)
+        manager.submit_load_job(
+            7,
+            [k_host, k_disk],
+            [11, 12],
+            "r",
+            tokens_by_source={CacheHitSource.HOST: 16, CacheHitSource.DISK: 16},
+        )
+        # The host tier lands before the drain; only the disk read is still in
+        # flight when the drain times out and poisons the job.
+        store.complete_load(sub_hashes(k_host))
+        self.assertEqual(manager.poll_finished_jobs(), [])
+        with patch.object(rs, "_DRAIN_TIMEOUT_S", 0.0):
+            manager.drain_jobs({7})
+        store.complete_remote_read(sub_hashes(k_disk))
+        (poisoned_job,) = manager.poll_finished_jobs()
+        self.assertFalse(poisoned_job.success)
+        stats = manager.get_stats()
+        assert stats is not None
+        self.assertEqual(
+            stats.data["data"][RaidenOffloadMetricName.FAILED_LOAD_JOBS],
+            {("disk", "posix"): 1},
+        )
+
+    def test_repeated_completion_report_does_not_stamp_tier_early(self):
+        from vllm.v1.metrics.cache_hit_source import CacheHitSource
+
+        from vllm_torchtpu.offload.metrics import RaidenOffloadMetricName
+
+        clock = _ManualClock(1.0)
+        store = FakeKVCacheStore()
+        manager = make_manager(store, metrics_clock=clock)
+        key = _key(1)
+        seed_host_entries(store, key)
+        manager.prepare_load([key], _ctx("r"))
+        manager.submit_load_job(
+            1, [key], [10], "r", tokens_by_source={CacheHitSource.HOST: 16}
+        )
+        s0, s1, s2, s3 = sub_hashes(key)
+        clock.advance(0.001)
+        store.complete_load([s0, s1, s2])
+        store._load_done.append(s0)  # The same sub-hash reported again.
+        self.assertEqual(manager.poll_finished_jobs(), [])
+        clock.advance(0.004)
+        store.complete_load([s3])
+        (finished,) = manager.poll_finished_jobs()
+        self.assertTrue(finished.success)
+        stats = manager.get_stats()
+        assert stats is not None
+        (latency,) = stats.data["data"][RaidenOffloadMetricName.LOAD_OBSERVED_LATENCY][
+            ("host", "dram")
+        ]
+        self.assertAlmostEqual(latency, 0.005)
 
 
 if __name__ == "__main__":

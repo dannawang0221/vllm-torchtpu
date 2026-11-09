@@ -319,6 +319,7 @@ class TPURaidenOffloadingScheduler(OffloadingConnectorScheduler):
                 device_block_ids,
                 job.req_id,
                 pinned=src_spec.pinned,
+                tokens_by_source=src_spec.tokens_by_source,
             )
 
         # Handle jobs_to_flush (source blocks are about to be recycled):
