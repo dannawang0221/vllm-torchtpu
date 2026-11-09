@@ -24,6 +24,9 @@ import pytest
 import torch
 from vllm.config import KVTransferConfig, VllmConfig
 from vllm.distributed.kv_transfer.kv_connector.v1.metrics import PromMetric
+from vllm.distributed.kv_transfer.kv_connector.v1.offloading.metrics import (
+    get_connector_metric_definitions,
+)
 from vllm.v1.kv_cache_interface import FullAttentionSpec, MambaSpec, SlidingWindowSpec
 from vllm.v1.kv_offload.base import ReqContext, make_offload_key
 from vllm.v1.kv_offload.factory import OffloadingSpecFactory
@@ -39,6 +42,7 @@ from vllm_torchtpu.offload.metrics import (
     P2P_OFFLOAD_LABELS,
     UNSPECIFIED_OFFLOAD_LABELS,
     LoadTimingState,
+    OffloadTransferMetricName,
     RaidenOffloadMetricName,
     RaidenOffloadPromMetrics,
     RaidenOffloadStatsCollector,
@@ -95,6 +99,12 @@ def _make_prom_metric_types(
         prometheus_client.Gauge: _Gauge,
         prometheus_client.Histogram: _Histogram,
     }
+
+
+def test_transfer_metric_names_match_upstream_connector_definitions() -> None:
+    upstream_defs = get_connector_metric_definitions()
+    for metric_name in OffloadTransferMetricName:
+        assert metric_name.value in upstream_defs
 
 
 def test_metric_definitions_have_directional_labels() -> None:
@@ -155,6 +165,7 @@ def test_filter_positive_source_tokens() -> None:
 def test_collector_unknown_sources_and_missing_key_handling() -> None:
     clock = _FakeClock(5.0)
     collector = RaidenOffloadStatsCollector(
+        bytes_per_sub_block=256,
         storage_backend=None,
         clock=clock,
     )
@@ -235,7 +246,7 @@ def test_collector_unknown_sources_and_missing_key_handling() -> None:
     timing.on_sub_hash_done(b"s0", clock())
     clock.advance(0.007)
     timing.on_sub_hash_done(b"s1", clock())
-    collector.on_load_finalized(timing, success=True)
+    collector.on_load_finalized(timing, success=True, now=clock())
 
     stats = collector.pop_stats()
     assert stats is not None
@@ -266,7 +277,7 @@ def test_collector_unknown_sources_and_missing_key_handling() -> None:
         tokens_by_source={CacheHitSource.EXTERNAL_UNSPECIFIED: 16},
     )
     fail_timing.on_sub_hash_failed(b"s2")
-    collector.on_load_finalized(fail_timing, success=False)
+    collector.on_load_finalized(fail_timing, success=False, now=clock())
 
     fail_stats = collector.pop_stats()
     assert fail_stats is not None
@@ -502,6 +513,7 @@ def test_select_saved_tokens_group() -> None:
 def test_collector_load_lifecycle_staggered_sources_and_partial_failure() -> None:
     clock = _FakeClock(10.0)
     collector = RaidenOffloadStatsCollector(
+        bytes_per_sub_block=1024,
         storage_backend="posix",
         clock=clock,
     )
@@ -533,7 +545,7 @@ def test_collector_load_lifecycle_staggered_sources_and_partial_failure() -> Non
     timing.on_sub_hash_done(b"p0", clock())
     clock.advance(0.032)
     timing.on_sub_hash_done(b"d0", clock())
-    collector.on_load_finalized(timing, success=True)
+    collector.on_load_finalized(timing, success=True, now=clock())
 
     stats = collector.pop_stats()
     assert stats is not None
@@ -548,6 +560,9 @@ def test_collector_load_lifecycle_staggered_sources_and_partial_failure() -> Non
         P2P_OFFLOAD_LABELS: 32,
         ("disk", "posix"): 48,
     }
+    assert values[OffloadTransferMetricName.LOAD_BYTES] == {(): 4 * 1024}
+    assert values[OffloadTransferMetricName.LOAD_TIME][()] == pytest.approx(0.04)
+    assert values[OffloadTransferMetricName.LOAD_SIZE] == {(): [4 * 1024]}
     assert values[RaidenOffloadMetricName.LOAD_OBSERVED_LATENCY][
         HOST_OFFLOAD_LABELS
     ] == [pytest.approx(0.002)]
@@ -571,7 +586,7 @@ def test_collector_load_lifecycle_staggered_sources_and_partial_failure() -> Non
     fail_timing.on_sub_hash_done(b"h2", clock())
     clock.advance(0.010)
     fail_timing.on_sub_hash_failed(b"d2")
-    collector.on_load_finalized(fail_timing, success=False)
+    collector.on_load_finalized(fail_timing, success=False, now=clock())
 
     fail_stats = collector.pop_stats()
     assert fail_stats is not None
@@ -657,11 +672,13 @@ def test_collector_save_lifecycle_dram_only_vs_storage() -> None:
 
     # DRAM-only save credits ("host", "dram") only.
     dram_collector = RaidenOffloadStatsCollector(
+        bytes_per_sub_block=512,
         storage_backend=None,
         clock=clock,
     )
     save_timing = dram_collector.start_save_timing(
         saved_token_ranges=ranges.values(),
+        num_saved_sub_hashes=4,
     )
     clock.advance(0.005)
     dram_collector.on_save_finalized(save_timing, success=True, now=clock())
@@ -674,15 +691,18 @@ def test_collector_save_lifecycle_dram_only_vs_storage() -> None:
     assert dram_values[RaidenOffloadMetricName.SAVE_OBSERVED_LATENCY] == {
         HOST_OFFLOAD_LABELS: [pytest.approx(0.005)]
     }
+    assert dram_values[OffloadTransferMetricName.STORE_BYTES] == {(): 2048}
 
     # Write-through storage save credits saved_tokens to both ("host", "dram")
     # and ("disk", "posix"), and records save_observed_latency under ("disk", "posix").
     storage_collector = RaidenOffloadStatsCollector(
+        bytes_per_sub_block=512,
         storage_backend="posix",
         clock=clock,
     )
     wt_timing = storage_collector.start_save_timing(
         saved_token_ranges=ranges.values(),
+        num_saved_sub_hashes=4,
     )
     clock.advance(0.025)
     storage_collector.on_save_finalized(wt_timing, success=True, now=clock())
@@ -700,6 +720,7 @@ def test_collector_save_lifecycle_dram_only_vs_storage() -> None:
     # Failed save records failed_save_jobs on destination and 0 saved_tokens.
     fail_timing = storage_collector.start_save_timing(
         saved_token_ranges=ranges.values(),
+        num_saved_sub_hashes=4,
     )
     storage_collector.on_save_finalized(fail_timing, success=False, now=clock())
     fail_stats = storage_collector.pop_stats()
@@ -740,6 +761,7 @@ def test_prom_metrics_registration_and_end_to_end_observation() -> None:
 
     clock = _FakeClock(1.0)
     collector = RaidenOffloadStatsCollector(
+        bytes_per_sub_block=256,
         storage_backend="posix",
         clock=clock,
     )
@@ -757,10 +779,11 @@ def test_prom_metrics_registration_and_end_to_end_observation() -> None:
     clock.advance(0.05)
     load_timing.on_sub_hash_done(b"s0", clock())
     load_timing.on_sub_hash_done(b"s1", clock())
-    collector.on_load_finalized(load_timing, success=True)
+    collector.on_load_finalized(load_timing, success=True, now=clock())
 
     save_timing = collector.start_save_timing(
         saved_token_ranges=[(0, 32)],
+        num_saved_sub_hashes=2,
     )
     clock.advance(0.02)
     collector.on_save_finalized(save_timing, success=True, now=clock())
@@ -773,7 +796,7 @@ def test_prom_metrics_registration_and_end_to_end_observation() -> None:
         tokens_by_source={CacheHitSource.P2P: 16},
     )
     p2p_fail_timing.on_sub_hash_failed(b"p_fail")
-    collector.on_load_finalized(p2p_fail_timing, success=False)
+    collector.on_load_finalized(p2p_fail_timing, success=False, now=clock())
     collector.record_failed_save(launched=True)
 
     raw_stats = collector.pop_stats()
@@ -843,6 +866,14 @@ def test_prom_metrics_registration_and_end_to_end_observation() -> None:
             "vllm:kv_offload_failed_save_jobs_total", disk_save_labels
         )
         == 1.0
+    )
+    assert (
+        registry.get_sample_value("vllm:kv_offload_load_bytes_total", base_labels)
+        == 512.0
+    )
+    assert (
+        registry.get_sample_value("vllm:kv_offload_store_bytes_total", base_labels)
+        == 512.0
     )
     # Deprecated CPUOffloadingSpec metric stays at its initial 0.0 value.
     assert (
