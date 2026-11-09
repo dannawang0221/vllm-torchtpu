@@ -4494,6 +4494,7 @@ class TestHitSourcesBySource(unittest.TestCase):
                 store = FakeKVCacheStore()
                 manager = make_global_manager(
                     store,
+                    bytes_per_sub_block=256,
                     storage_backend=backend_label,
                 )
                 sched = _make_real_scheduler(manager, block_size=self.BLOCK)
@@ -4921,6 +4922,7 @@ class TestHitSourcesBySource(unittest.TestCase):
         store = FakeKVCacheStore()
         manager = make_global_manager(
             store,
+            bytes_per_sub_block=128,
             tokens_per_chunk_by_group={0: self.BLOCK},
             storage_backend="posix",
             metrics_clock=clock,
@@ -4999,7 +5001,7 @@ class TestHitSourcesBySource(unittest.TestCase):
 
 
 class TestLoadMetricsBySource(unittest.TestCase):
-    """Per-source load latency, loaded tokens, and failure counters."""
+    """Per-source load latency, loaded tokens, byte stats, and failure counters."""
 
     BLOCK = 16
 
@@ -5008,12 +5010,16 @@ class TestLoadMetricsBySource(unittest.TestCase):
         from vllm.v1.core.kv_cache_utils import KVCacheBlock
         from vllm.v1.core.sched.output import SchedulerOutput
 
-        from vllm_torchtpu.offload.metrics import RaidenOffloadMetricName
+        from vllm_torchtpu.offload.metrics import (
+            OffloadTransferMetricName,
+            RaidenOffloadMetricName,
+        )
 
         clock = _ManualClock(100.0)
         store = FakeKVCacheStore()
         manager = make_global_manager(
             store,
+            bytes_per_sub_block=512,
             storage_backend="posix",
             metrics_clock=clock,
         )
@@ -5075,6 +5081,10 @@ class TestLoadMetricsBySource(unittest.TestCase):
             values[RaidenOffloadMetricName.LOAD_OBSERVED_LATENCY][("disk", "posix")][0],
             0.045,
         )
+        # 3 logical blocks * 4 sub-blocks * 512B = 6144 bytes.
+        self.assertEqual(values[OffloadTransferMetricName.LOAD_BYTES], {(): 6144})
+        self.assertAlmostEqual(values[OffloadTransferMetricName.LOAD_TIME][()], 0.045)
+        self.assertEqual(values[OffloadTransferMetricName.LOAD_SIZE], {(): [6144]})
 
     def test_load_failure_modes_and_unpinned_eviction_boundary(self):
         from vllm.v1.core.kv_cache_manager import KVCacheBlocks
@@ -5251,7 +5261,7 @@ class TestLoadMetricsBySource(unittest.TestCase):
 
 
 class TestSaveMetricsByDestination(unittest.TestCase):
-    """Save latency, deduplicated saved tokens, and failure counters."""
+    """Save latency, deduplicated saved tokens, byte stats, and failure counters."""
 
     BLOCK = 16
 
@@ -5259,7 +5269,10 @@ class TestSaveMetricsByDestination(unittest.TestCase):
         from vllm.v1.core.sched.output import NewRequestData, SchedulerOutput
         from vllm.v1.outputs import KVConnectorOutput
 
-        from vllm_torchtpu.offload.metrics import RaidenOffloadMetricName
+        from vllm_torchtpu.offload.metrics import (
+            OffloadTransferMetricName,
+            RaidenOffloadMetricName,
+        )
         from vllm_torchtpu.offload.raiden_connector import (
             RaidenOffloadingWorkerMetadata,
         )
@@ -5270,6 +5283,7 @@ class TestSaveMetricsByDestination(unittest.TestCase):
                 store = FakeKVCacheStore()
                 manager = make_manager(
                     store,
+                    bytes_per_sub_block=256,
                     tokens_per_chunk_by_group={0: self.BLOCK, 1: self.BLOCK},
                     mamba_group_ids={1},
                     saved_tokens_group=0,
@@ -5332,16 +5346,27 @@ class TestSaveMetricsByDestination(unittest.TestCase):
                     ],
                     0.012,
                 )
+                self.assertEqual(
+                    values[OffloadTransferMetricName.STORE_BYTES],
+                    {(): 12 * 256},
+                )
+                self.assertAlmostEqual(
+                    values[OffloadTransferMetricName.STORE_TIME][()], 0.012
+                )
 
     def test_saved_tokens_count_one_kv_cache_group_across_store_jobs(self):
         # In mamba_cache_mode="align" (required on TPU for hybrid prefix
         # caching), upstream stores each Mamba boundary state in its own job,
         # apart from the attention job covering the same tokens.
-        from vllm_torchtpu.offload.metrics import RaidenOffloadMetricName
+        from vllm_torchtpu.offload.metrics import (
+            OffloadTransferMetricName,
+            RaidenOffloadMetricName,
+        )
 
         store = FakeKVCacheStore()
         manager = make_manager(
             store,
+            bytes_per_sub_block=128,
             tokens_per_chunk_by_group={0: self.BLOCK, 1: self.BLOCK},
             mamba_group_ids={1},
             saved_tokens_group=0,
@@ -5369,14 +5394,22 @@ class TestSaveMetricsByDestination(unittest.TestCase):
             values[RaidenOffloadMetricName.SAVED_TOKENS],
             {("host", "dram"): self.BLOCK},
         )
+        # Both jobs' bytes still count: 2 keys * 4 sub-blocks * 128 B.
+        self.assertEqual(
+            values[OffloadTransferMetricName.STORE_BYTES], {(): 2 * 4 * 128}
+        )
 
     def test_already_resident_and_partial_resident_save_credits_only_new_blocks(self):
-        from vllm_torchtpu.offload.metrics import RaidenOffloadMetricName
+        from vllm_torchtpu.offload.metrics import (
+            OffloadTransferMetricName,
+            RaidenOffloadMetricName,
+        )
 
         clock = _ManualClock(5.0)
         store = FakeKVCacheStore()
         manager = make_manager(
             store,
+            bytes_per_sub_block=128,
             storage_backend="posix",
             tokens_per_chunk_by_group={0: 16},
             saved_tokens_group=0,
@@ -5403,10 +5436,14 @@ class TestSaveMetricsByDestination(unittest.TestCase):
         stats = manager.get_stats()
         assert stats is not None
         values = stats.data["data"]
-        # Only k1 (16 tokens) was newly saved.
+        # Only k1 (16 tokens, 4 sub-blocks = 512 bytes) was newly saved!
         self.assertEqual(
             values[RaidenOffloadMetricName.SAVED_TOKENS],
             {("host", "dram"): 16, ("disk", "posix"): 16},
+        )
+        self.assertEqual(
+            values[OffloadTransferMetricName.STORE_BYTES],
+            {(): 4 * 128},
         )
 
         # Fully resident batch (to_save == []) emits no metrics at all.
@@ -5419,7 +5456,7 @@ class TestSaveMetricsByDestination(unittest.TestCase):
         self.assertIsNone(manager.get_stats())
 
         # A key whose first 3 sub-blocks are still host-resident re-saves only
-        # the evicted last one: tokens [60, 64).
+        # the evicted last one: tokens [60, 64), 1 sub-block = 128 bytes.
         k3 = _group_key(3, 0)
         req_ctx.set_offload_key_position(k3, 64)
         for sub_hash in sub_hashes(k3)[:3]:
@@ -5439,6 +5476,7 @@ class TestSaveMetricsByDestination(unittest.TestCase):
             values[RaidenOffloadMetricName.SAVED_TOKENS],
             {("host", "dram"): 4, ("disk", "posix"): 4},
         )
+        self.assertEqual(values[OffloadTransferMetricName.STORE_BYTES], {(): 128})
 
     def test_failed_save_destination_follows_failure_stage(self):
         # With a storage tier, a save that never launched failed in the host
@@ -5483,6 +5521,7 @@ class TestSaveMetricsByDestination(unittest.TestCase):
         store = FakeKVCacheStore()
         manager = make_manager(
             store,
+            bytes_per_sub_block=128,
             tokens_per_chunk_by_group={0: 16},
             saved_tokens_group=0,
             metrics_clock=clock,

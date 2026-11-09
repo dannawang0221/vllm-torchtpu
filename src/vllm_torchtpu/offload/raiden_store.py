@@ -388,6 +388,7 @@ class RaidenOffloadingManager(OffloadingManager):
         # `saved_tokens_group` is the KV cache group whose store keys count
         # `saved_tokens` (None: no saved-token accounting), and
         # `storage_backend` labels the storage tier (None: DRAM-only).
+        bytes_per_sub_block: int = 0,
         tokens_per_chunk_by_group: Mapping[int, int] | None = None,
         mamba_group_ids: Iterable[int] = (),
         saved_tokens_group: int | None = None,
@@ -555,6 +556,7 @@ class RaidenOffloadingManager(OffloadingManager):
         ), (saved_tokens_group, self._tokens_per_chunk_by_group)
         self._saved_tokens_group = saved_tokens_group
         self._metrics = RaidenOffloadStatsCollector(
+            bytes_per_sub_block=bytes_per_sub_block,
             storage_backend=storage_backend,
             clock=metrics_clock,
         )
@@ -1159,6 +1161,7 @@ class RaidenOffloadingManager(OffloadingManager):
             saved_token_ranges=self._saved_token_ranges(
                 keys, sub_hashes, to_save, key_token_ranges or {}
             ),
+            num_saved_sub_hashes=len(to_save),
         )
         if not self._store.save(to_save):
             # Synchronous launch failure: finalize immediately to revert the
@@ -1388,6 +1391,7 @@ class RaidenOffloadingManager(OffloadingManager):
                 admission.load_timing,
                 success=success,
                 poisoned=admission.poisoned,
+                now=now,
             )
             self._finished.append(
                 FinishedJob(
@@ -2719,6 +2723,9 @@ class TPURaidenStoreOffloadingSpec(OffloadingSpec):
                 config.worker_kv_bytes_per_block * self.world_size
             )
         assert bytes_per_block_all_ranks > 0
+        self.bytes_per_sub_block = (
+            bytes_per_block_all_ranks // self.device_block_size_factor
+        )
         self.offload_logical_blocks_capacity = int(
             int(cpu_bytes_to_use) // bytes_per_block_all_ranks
         )
@@ -2877,6 +2884,7 @@ class TPURaidenStoreOffloadingSpec(OffloadingSpec):
                 key_namespace=self.key_namespace,
                 secondary_backend_configs=secondary_backend_configs,
                 dp_rank=self.dp_rank,
+                bytes_per_sub_block=self.bytes_per_sub_block,
                 tokens_per_chunk_by_group={
                     group.group_id: group.tokens_per_block * self.blocks_per_chunk
                     for group in self.config.groups

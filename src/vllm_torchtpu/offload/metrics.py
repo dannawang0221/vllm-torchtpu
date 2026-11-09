@@ -122,6 +122,27 @@ class RaidenOffloadMetricName(enum.StrEnum):
     FAILED_SAVE_JOBS = "vllm:kv_offload_failed_save_jobs"
 
 
+class OffloadTransferMetricName(enum.StrEnum):
+    """Upstream flat transfer metric names populated scheduler-side.
+
+    Upstream `OffloadingConnector` normally populates these from worker-side
+    `TransferResult`s, which Raiden never emits because transfers are driven by
+    the scheduler-side controller. Recording these keys in
+    `OffloadingConnectorStats` lets `OffloadPromMetrics` observe them directly.
+
+    Raiden records one sample per job: bytes summed over every worker rank, and
+    time from launch until a scheduler step observes completion, so `*_TIME` is
+    rounded up to engine steps like the observed-latency histograms.
+    """
+
+    LOAD_BYTES = "vllm:kv_offload_load_bytes"
+    LOAD_TIME = "vllm:kv_offload_load_time"
+    LOAD_SIZE = "vllm:kv_offload_load_size"
+    STORE_BYTES = "vllm:kv_offload_store_bytes"
+    STORE_TIME = "vllm:kv_offload_store_time"
+    STORE_SIZE = "vllm:kv_offload_store_size"
+
+
 def build_raiden_offload_metric_definitions(
     extra_config: Mapping[str, Any],
 ) -> dict[str, OffloadingMetricMetadata]:
@@ -239,9 +260,10 @@ class RaidenOffloadPromMetrics(OffloadPromMetrics):
 
     `configured_tier_labels` holds the `(source, backend)` labels of the tiers
     the deployment enables. Each engine's hit, load, and save series for these
-    tiers are created at 0 on startup. Prometheus counts a series from the
-    first value it scrapes, so `rate()` and `increase()` would miss the first
-    increment of a series that only appeared with that increment.
+    tiers are created at 0 on startup, and so are its transfer byte, time, and
+    size series. Prometheus counts a series from the first value it scrapes,
+    so `rate()` and `increase()` would miss the first increment of a series
+    that only appeared with that increment.
     """
 
     def __init__(
@@ -298,6 +320,18 @@ class RaidenOffloadPromMetrics(OffloadPromMetrics):
             RaidenOffloadMetricName.SAVE_OBSERVED_LATENCY,
             save_destinations[-1],
         )
+        for counter in (
+            OffloadTransferMetricName.LOAD_BYTES,
+            OffloadTransferMetricName.LOAD_TIME,
+            OffloadTransferMetricName.STORE_BYTES,
+            OffloadTransferMetricName.STORE_TIME,
+        ):
+            zero_stats.increase_counter(counter, 0)
+        for histogram in (
+            OffloadTransferMetricName.LOAD_SIZE,
+            OffloadTransferMetricName.STORE_SIZE,
+        ):
+            _add_unobserved_histogram(zero_stats, histogram, ())
         for engine_idx in per_engine_labelvalues:
             self.observe(zero_stats.data, engine_idx)
 
@@ -464,6 +498,7 @@ class LoadTimingState:
     # host DRAM load.
     remote: dict[bytes, _TierProgress]
     tokens_by_source: dict[CacheHitSource, int]
+    num_sub_hashes: int
 
     @property
     def tiers(self) -> tuple[_TierProgress, ...]:
@@ -514,6 +549,7 @@ class SaveTimingState:
 
     started_at: float
     saved_tokens: int
+    num_sub_hashes: int
 
 
 class RaidenOffloadStatsCollector:
@@ -522,9 +558,11 @@ class RaidenOffloadStatsCollector:
     def __init__(
         self,
         *,
+        bytes_per_sub_block: int = 0,
         storage_backend: str | None = None,
         clock: Callable[[], float] | None = None,
     ):
+        self._bytes_per_sub_block = bytes_per_sub_block
         self._storage_backend = storage_backend
         self._clock = clock
         self._stats = OffloadingConnectorStats()
@@ -827,6 +865,7 @@ class RaidenOffloadStatsCollector:
                 if tokens_by_source
                 else {}
             ),
+            num_sub_hashes=len(local_hashes) + len(remote_hashes),
         )
 
     def on_load_finalized(
@@ -835,8 +874,10 @@ class RaidenOffloadStatsCollector:
         *,
         success: bool,
         poisoned: bool = False,
+        now: float | None = None,
     ) -> None:
-        """Emit load token, latency, and failure metrics."""
+        """Emit load token, latency, failure, and byte/time/size metrics."""
+        finish_time = self.now() if now is None else now
         tiers = timing.tiers
         completed = [
             (tier.source, completed_at)
@@ -855,8 +896,8 @@ class RaidenOffloadStatsCollector:
                     labelvalues=self.source_labels(source),
                 )
         if success:
-            # Credit loaded tokens only when the entire job succeeded; on any
-            # failure vLLM discards the blocks and recomputes.
+            # Credit loaded tokens and transfer bytes only when the entire job
+            # succeeded; on any failure vLLM discards the blocks and recomputes.
             for source, count in timing.tokens_by_source.items():
                 if count > 0:
                     self._stats.increase_counter(
@@ -864,6 +905,22 @@ class RaidenOffloadStatsCollector:
                         count,
                         labelvalues=self.source_labels(source),
                     )
+            if self._bytes_per_sub_block > 0 and timing.num_sub_hashes > 0:
+                total_bytes = timing.num_sub_hashes * self._bytes_per_sub_block
+                end_time = max(
+                    (completed_at for _, completed_at in completed),
+                    default=finish_time,
+                )
+                duration = max(0.0, end_time - timing.started_at)
+                self._stats.increase_counter(
+                    OffloadTransferMetricName.LOAD_BYTES, total_bytes
+                )
+                self._stats.increase_counter(
+                    OffloadTransferMetricName.LOAD_TIME, duration
+                )
+                self._stats.observe_histogram(
+                    OffloadTransferMetricName.LOAD_SIZE, total_bytes
+                )
             return
 
         # Blame only the tier(s) whose transfers failed, or that were still in
@@ -903,11 +960,13 @@ class RaidenOffloadStatsCollector:
         self,
         *,
         saved_token_ranges: Iterable[tuple[int, int]],
+        num_saved_sub_hashes: int,
     ) -> SaveTimingState:
         """Initialize timing and deduplicated token count for an active save."""
         return SaveTimingState(
             started_at=self.now(),
             saved_tokens=count_merged_tokens(saved_token_ranges),
+            num_sub_hashes=num_saved_sub_hashes,
         )
 
     def on_save_finalized(
@@ -917,7 +976,7 @@ class RaidenOffloadStatsCollector:
         success: bool,
         now: float | None = None,
     ) -> None:
-        """Emit save token, latency, and failure metrics."""
+        """Emit save token, latency, failure, and byte/time/size metrics."""
         if not success:
             self.record_failed_save(launched=True)
             return
@@ -943,6 +1002,15 @@ class RaidenOffloadStatsCollector:
                     timing.saved_tokens,
                     labelvalues=(CacheHitSource.DISK.value, self._storage_backend),
                 )
+        if self._bytes_per_sub_block > 0 and timing.num_sub_hashes > 0:
+            total_bytes = timing.num_sub_hashes * self._bytes_per_sub_block
+            self._stats.increase_counter(
+                OffloadTransferMetricName.STORE_BYTES, total_bytes
+            )
+            self._stats.increase_counter(OffloadTransferMetricName.STORE_TIME, duration)
+            self._stats.observe_histogram(
+                OffloadTransferMetricName.STORE_SIZE, total_bytes
+            )
 
     def pop_stats(self) -> OffloadingConnectorStats | None:
         """Drain accumulated per-step stats deltas for IPC, or `None` if idle.
