@@ -83,12 +83,17 @@ import os
 import socket
 import threading
 import time
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, cast
 
 from vllm.config import VllmConfig
-from vllm.v1.kv_cache_interface import AttentionSpec, FullAttentionSpec, KVCacheConfig
+from vllm.v1.kv_cache_interface import (
+    AttentionSpec,
+    FullAttentionSpec,
+    KVCacheConfig,
+    MambaSpec,
+)
 from vllm.v1.kv_offload.base import (
     CanonicalKVCaches,
     LoadStoreSpec,
@@ -97,6 +102,7 @@ from vllm.v1.kv_offload.base import (
     Medium,
     OffloadingEvent,
     OffloadingManager,
+    OffloadingMetricMetadata,
     OffloadingSpec,
     OffloadingWorker,
     OffloadKey,
@@ -108,6 +114,7 @@ from vllm.v1.kv_offload.base import (
     get_offload_group_idx,
 )
 from vllm.v1.kv_offload.config import OffloadingConfig
+from vllm.v1.metrics.cache_hit_source import CacheHitSource
 
 from vllm_torchtpu import envs
 from vllm_torchtpu.block_major_pool import unified_block_major_enabled
@@ -116,9 +123,21 @@ from vllm_torchtpu.offload.block_major_layout import (
     BlockMajorContract,
     resolve_block_major_contract,
 )
+from vllm_torchtpu.offload.metrics import (
+    LoadTimingState,
+    RaidenOffloadStatsCollector,
+    SaveTimingState,
+    build_raiden_offload_metric_definitions,
+    compute_store_key_token_ranges,
+    saved_sub_block_ranges,
+    select_saved_tokens_group,
+)
 
 if TYPE_CHECKING:
     import torch
+    from vllm.distributed.kv_transfer.kv_connector.v1.offloading.metrics import (
+        OffloadingConnectorStats,
+    )
 
 logger = init_logger(__name__)
 
@@ -234,9 +253,19 @@ class RaidenLoadStoreSpec(LoadStoreSpec):
     allowing vLLM to recompute the blocks.
     """
 
-    def __init__(self, keys: list[OffloadKey], pinned: bool = True):
+    def __init__(
+        self,
+        keys: list[OffloadKey],
+        pinned: bool = True,
+        *,
+        key_token_ranges: Mapping[OffloadKey, tuple[int, int]] | None = None,
+    ):
         self.keys = keys
         self.pinned = pinned
+        self.tokens_by_source: dict[CacheHitSource, int] | None = None
+        self.key_token_ranges: dict[OffloadKey, tuple[int, int]] = (
+            dict(key_token_ranges) if key_token_ranges else {}
+        )
 
     def __repr__(self) -> str:
         return (
@@ -294,6 +323,8 @@ class Admission:
     # retry exactly this subset), and launch failures pre-fill the batch.
     failed_sub_hashes: list[bytes] = field(default_factory=list)
     retries_left: int = 0
+    load_timing: LoadTimingState | None = None
+    save_timing: SaveTimingState | None = None
 
 
 @dataclass
@@ -329,6 +360,16 @@ class RaidenOffloadingManager(OffloadingManager):
         # Storage tier behind the host DRAM pool: raiden BackendConfigs from
         # `build_store_storage_backend_config`. Empty keeps the store DRAM-only.
         secondary_backend_configs: Sequence[object] = (),
+        # Metrics geometry, derived by `TPURaidenStoreOffloadingSpec`:
+        # `saved_tokens_group` is the KV cache group whose store keys count
+        # `saved_tokens` (None: no saved-token accounting), and
+        # `storage_backend` labels the storage tier (None: DRAM-only).
+        bytes_per_sub_block: int = 0,
+        tokens_per_chunk_by_group: Mapping[int, int] | None = None,
+        mamba_group_ids: Iterable[int] = (),
+        saved_tokens_group: int | None = None,
+        storage_backend: str | None = None,
+        metrics_clock: Callable[[], float] | None = None,
         # Test overrides: allow injecting mock store instance and type bindings.
         store: Any = None,
         store_types: Any = None,
@@ -474,6 +515,43 @@ class RaidenOffloadingManager(OffloadingManager):
         self._admissions: dict[int, Admission] = {}
         self._hash_to_admission: dict[bytes, Admission] = {}
         self._finished: list[FinishedJob] = []
+        self._tokens_per_chunk_by_group: dict[int, int] = (
+            dict(tokens_per_chunk_by_group) if tokens_per_chunk_by_group else {}
+        )
+        self._mamba_group_ids: frozenset[int] = frozenset(mamba_group_ids)
+        assert (
+            saved_tokens_group is None
+            or saved_tokens_group in self._tokens_per_chunk_by_group
+        ), (saved_tokens_group, self._tokens_per_chunk_by_group)
+        self._saved_tokens_group = saved_tokens_group
+        self._metrics = RaidenOffloadStatsCollector(
+            bytes_per_sub_block=bytes_per_sub_block,
+            storage_backend=storage_backend,
+            clock=metrics_clock,
+        )
+
+    def compute_load_tokens_by_source(
+        self,
+        *,
+        start_token: int,
+        end_token: int,
+        load_key_ranges: Iterable[tuple[int, int, OffloadKey]],
+    ) -> dict[CacheHitSource, int]:
+        return self._metrics.compute_load_tokens_by_source(
+            start_token=start_token,
+            end_token=end_token,
+            load_key_ranges=load_key_ranges,
+            tokens_per_chunk_by_group=self._tokens_per_chunk_by_group,
+            mamba_group_ids=self._mamba_group_ids,
+        )
+
+    def record_admission_hits(
+        self,
+        tokens_by_source: Mapping[CacheHitSource, int],
+        *,
+        preempted: bool = False,
+    ) -> None:
+        self._metrics.record_admission_hits(tokens_by_source, preempted=preempted)
 
     # -- sub-hash / block-id expansion ----------------------------------
 
@@ -770,6 +848,13 @@ class RaidenOffloadingManager(OffloadingManager):
                 return RaidenLoadStoreSpec(keys, pinned=False)
             idx = resolved_to
         self._pending_remote_slices.update(remote_slices)
+        self._metrics.record_prepared_load(
+            keys,
+            self._device_block_size_factor,
+            remote_slices,
+            sub_hashes,
+            self._block_status,
+        )
         return RaidenLoadStoreSpec(keys)
 
     def prepare_store(self, keys, req_context: ReqContext) -> PrepareStoreOutput | None:
@@ -807,9 +892,21 @@ class RaidenOffloadingManager(OffloadingManager):
         # tracking here only stops duplicate admission of the same key from a
         # concurrent request.
         self._inflight_store_keys.update(keys_to_store)
+        key_token_ranges: dict[OffloadKey, tuple[int, int]] = {}
+        if self._saved_tokens_group is not None:
+            key_token_ranges = compute_store_key_token_ranges(
+                keys_to_store,
+                req_context,
+                group_idx=self._saved_tokens_group,
+                tokens_per_chunk=self._tokens_per_chunk_by_group[
+                    self._saved_tokens_group
+                ],
+            )
         return PrepareStoreOutput(
             keys_to_store=keys_to_store,
-            store_spec=RaidenLoadStoreSpec(keys_to_store),
+            store_spec=RaidenLoadStoreSpec(
+                keys_to_store, key_token_ranges=key_token_ranges
+            ),
             evicted_keys=[],
         )
 
@@ -874,6 +971,10 @@ class RaidenOffloadingManager(OffloadingManager):
         # read_remote. Drop the leftovers each step; a request retried
         # next step re-runs lookup() and repopulates the stash.
         self._remote_slices.clear()
+        self._metrics.on_schedule_end()
+
+    def get_stats(self) -> OffloadingConnectorStats | None:
+        return self._metrics.pop_stats()
 
     def reset_cache(self) -> None:
         # Backstop only: TPURaidenOffloadingConnector.reset_cache() reports
@@ -900,8 +1001,47 @@ class RaidenOffloadingManager(OffloadingManager):
 
     # -- job submission bridge (called by the connector scheduler) --------
 
+    def _saved_token_ranges(
+        self,
+        keys: list[OffloadKey],
+        sub_hashes: list[bytes],
+        to_save: list[bytes],
+        key_token_ranges: Mapping[OffloadKey, tuple[int, int]],
+    ) -> list[tuple[int, int]]:
+        """Token spans a save writes: whole keys, or only the saved sub-blocks
+        of a key whose other sub-blocks were already host-resident."""
+        if len(to_save) == len(sub_hashes):
+            return [key_token_ranges[key] for key in keys if key in key_token_ranges]
+        if not key_token_ranges:
+            return []
+        assert self._saved_tokens_group is not None
+        to_save_set = set(to_save)
+        factor = self._device_block_size_factor
+        tokens_per_chunk = self._tokens_per_chunk_by_group[self._saved_tokens_group]
+        atomic = self._saved_tokens_group in self._mamba_group_ids
+        ranges: list[tuple[int, int]] = []
+        for idx, key in enumerate(keys):
+            key_range = key_token_ranges.get(key)
+            if key_range is None:
+                continue
+            key_sub_hashes = sub_hashes[idx * factor : (idx + 1) * factor]
+            ranges.extend(
+                saved_sub_block_ranges(
+                    key_range,
+                    [sub_hash in to_save_set for sub_hash in key_sub_hashes],
+                    tokens_per_chunk,
+                    atomic=atomic,
+                )
+            )
+        return ranges
+
     def submit_store_job(
-        self, job_id: int, keys: list[OffloadKey], device_block_ids: list[int]
+        self,
+        job_id: int,
+        keys: list[OffloadKey],
+        device_block_ids: list[int],
+        *,
+        key_token_ranges: Mapping[OffloadKey, tuple[int, int]] | None = None,
     ) -> None:
         """Admit and launch a store job after all worker ranks acknowledge
         the save fence.
@@ -937,6 +1077,7 @@ class RaidenOffloadingManager(OffloadingManager):
                 len(sub_hashes),
             )
             self._inflight_store_keys.difference_update(keys)
+            self._metrics.record_failed_save(launched=False)
             self._finished.append(
                 FinishedJob(job_id=job_id, op=AdmissionOp.STORE, success=False)
             )
@@ -947,6 +1088,7 @@ class RaidenOffloadingManager(OffloadingManager):
             # blocks recompute and the key is re-offered on its next miss.
             self._store.release(sub_hashes)
             self._inflight_store_keys.difference_update(keys)
+            self._metrics.record_failed_save(launched=False)
             self._finished.append(
                 FinishedJob(job_id=job_id, op=AdmissionOp.STORE, success=False)
             )
@@ -960,6 +1102,12 @@ class RaidenOffloadingManager(OffloadingManager):
                 FinishedJob(job_id=job_id, op=AdmissionOp.STORE, success=True)
             )
             return
+        save_timing = self._metrics.start_save_timing(
+            saved_token_ranges=self._saved_token_ranges(
+                keys, sub_hashes, to_save, key_token_ranges or {}
+            ),
+            num_saved_sub_hashes=len(to_save),
+        )
         if not self._store.save(to_save):
             # Synchronous launch failure: finalize immediately to revert the
             # admitted entries.
@@ -969,6 +1117,7 @@ class RaidenOffloadingManager(OffloadingManager):
                 job_id,
                 len(to_save),
             )
+            self._metrics.record_failed_save(launched=False)
             self._finalize(
                 Admission(
                     job_id=job_id,
@@ -989,6 +1138,7 @@ class RaidenOffloadingManager(OffloadingManager):
             pending=set(to_save),
             saved_sub_hashes=to_save,
             retries_left=_SAVE_RETRIES,
+            save_timing=save_timing,
         )
         self._admissions[job_id] = admission
         for sub_hash in to_save:
@@ -1001,12 +1151,15 @@ class RaidenOffloadingManager(OffloadingManager):
         device_block_ids: list[int],
         req_id: str,
         pinned: bool = True,
+        *,
+        tokens_by_source: Mapping[CacheHitSource, int] | None = None,
     ) -> None:
         """Launch a load job; entries were pinned in prepare_load."""
         assert len(keys) == len(device_block_ids), (len(keys), len(device_block_ids))
         if not pinned:
-            # prepare_load lost the pin race; nothing is held, so fail the
-            # job without touching the store and let vLLM recompute.
+            # prepare_load lost the pin race before any transfer launched;
+            # nothing is held, so signal recompute to vLLM without touching
+            # the store or recording a failed transfer job.
             self._finished.append(
                 FinishedJob(
                     job_id=job_id,
@@ -1044,6 +1197,14 @@ class RaidenOffloadingManager(OffloadingManager):
                 local_hashes.append(sub_hash)
                 dst_device_ids_for_local.append(dev_id)
 
+        load_timing = self._metrics.start_load_timing(
+            local_hashes=local_hashes,
+            remote_hashes=remote_hashes,
+            remote_slices=remote_slices,
+            block_status_cls=self._block_status,
+            tokens_by_source=tokens_by_source,
+        )
+
         def _fail_launch(
             what: str, failed_hashes: list[bytes], in_flight: list[bytes]
         ) -> None:
@@ -1068,6 +1229,7 @@ class RaidenOffloadingManager(OffloadingManager):
                 dst_device_block_ids=list(device_block_ids),
                 remote_sub_hashes=set(remote_hashes),
                 failed_sub_hashes=list(failed_hashes),
+                load_timing=load_timing,
             )
             if in_flight:
                 # The other launch already succeeded: the job must stay
@@ -1087,11 +1249,13 @@ class RaidenOffloadingManager(OffloadingManager):
         if local_hashes and not self._store.load(
             local_hashes, dst_device_ids_for_local
         ):
+            load_timing.mark_local_launch_failed()
             _fail_launch("load()", local_hashes, [])
             return
         if remote_hashes and not self._store.read_remote(
             remote_hashes, remote_slices, dst_device_ids_for_remote
         ):
+            load_timing.mark_remote_launch_failed()
             _fail_launch("read_remote()", remote_hashes, local_hashes)
             return
         admission = Admission(
@@ -1103,6 +1267,7 @@ class RaidenOffloadingManager(OffloadingManager):
             req_id=req_id,
             dst_device_block_ids=list(device_block_ids),
             remote_sub_hashes=set(remote_hashes),
+            load_timing=load_timing,
         )
         self._admissions[job_id] = admission
         for sub_hash in sub_hashes:
@@ -1118,7 +1283,7 @@ class RaidenOffloadingManager(OffloadingManager):
 
     # -- finalizer --------------------------------------------------------
 
-    def _finalize(self, admission: Admission) -> None:
+    def _finalize(self, admission: Admission, *, now: float | None = None) -> None:
         # Launch failures finalize an admission that was never registered,
         # so the pop tolerates absence; both paths share this one terminal
         # transition (cleanup, finished-job report).
@@ -1136,6 +1301,13 @@ class RaidenOffloadingManager(OffloadingManager):
             self._store.release(held)
         if admission.op == AdmissionOp.STORE:
             self._inflight_store_keys.difference_update(admission.keys)
+            # A save that never launched was counted where its launch failed.
+            if admission.save_timing is not None:
+                self._metrics.on_save_finalized(
+                    admission.save_timing,
+                    success=success,
+                    now=now,
+                )
             self._finished.append(
                 FinishedJob(
                     job_id=admission.job_id, op=AdmissionOp.STORE, success=success
@@ -1144,6 +1316,13 @@ class RaidenOffloadingManager(OffloadingManager):
         else:
             if admission.failed:
                 self._mark_unloadable(admission)
+            assert admission.load_timing is not None
+            self._metrics.on_load_finalized(
+                admission.load_timing,
+                success=success,
+                poisoned=admission.poisoned,
+                now=now,
+            )
             self._finished.append(
                 FinishedJob(
                     job_id=admission.job_id,
@@ -1260,11 +1439,15 @@ class RaidenOffloadingManager(OffloadingManager):
         # Keyed by job_id: a mixed batch whose last hashes resolve in the
         # same poll (some done, some failed) must finalize exactly once.
         newly_terminal: dict[int, Admission] = {}
+        now = self._metrics.now()
         for done, failed in results:
             for sub_hash in failed:
                 admission = self._hash_to_admission.get(sub_hash)
                 if admission is None:
                     continue
+                timing = admission.load_timing
+                if timing is not None and sub_hash in admission.pending:
+                    timing.on_sub_hash_failed(sub_hash)
                 admission.failed = True
                 admission.failed_sub_hashes.append(sub_hash)
                 admission.pending.discard(sub_hash)
@@ -1274,6 +1457,9 @@ class RaidenOffloadingManager(OffloadingManager):
                 admission = self._hash_to_admission.get(sub_hash)
                 if admission is None:
                     continue
+                timing = admission.load_timing
+                if timing is not None and sub_hash in admission.pending:
+                    timing.on_sub_hash_done(sub_hash, now)
                 if sub_hash not in admission.remote_sub_hashes:
                     # A save or a local load that landed spends the pin the
                     # job was holding for that sub-hash.
@@ -1284,7 +1470,7 @@ class RaidenOffloadingManager(OffloadingManager):
         for admission in newly_terminal.values():
             if self._maybe_retry_save(admission):
                 continue
-            self._finalize(admission)
+            self._finalize(admission, now=now)
 
     def _maybe_retry_save(self, admission: Admission) -> bool:
         """Re-issue the failed subset of a store job's save, at most
@@ -1370,7 +1556,10 @@ class RaidenOffloadingManager(OffloadingManager):
                 return drained
             if time.perf_counter() >= deadline:
                 for job_id in live:
-                    self._admissions[job_id].poisoned = True
+                    admission = self._admissions[job_id]
+                    admission.poisoned = True
+                    if admission.load_timing is not None:
+                        admission.load_timing.mark_poisoned()
                 logger.error(
                     "TPURaidenOffloadingConnector: drain timed out after %.1fs; "
                     "poisoned jobs %s (%d keys): their transfers are still in flight "
@@ -2333,6 +2522,12 @@ class TPURaidenStoreOffloadingSpec(OffloadingSpec):
     distributed registry settings.
     """
 
+    @classmethod
+    def build_metric_definitions(
+        cls, extra_config: dict[str, Any]
+    ) -> dict[str, OffloadingMetricMetadata]:
+        return build_raiden_offload_metric_definitions(extra_config)
+
     def __init__(
         self,
         config: OffloadingConfig,
@@ -2359,8 +2554,6 @@ class TPURaidenStoreOffloadingSpec(OffloadingSpec):
 
         # Ensure model-level hybrid flag and KV cache group specs agree before
         # resolving attention kernel geometry.
-        from vllm.v1.kv_cache_interface import MambaSpec
-
         self.is_hybrid_model = vllm_config.model_config.is_hybrid
         has_mamba_group = any(
             isinstance(g.kv_cache_spec, MambaSpec)
@@ -2439,6 +2632,9 @@ class TPURaidenStoreOffloadingSpec(OffloadingSpec):
                 config.worker_kv_bytes_per_block * self.world_size
             )
         assert bytes_per_block_all_ranks > 0
+        self.bytes_per_sub_block = (
+            bytes_per_block_all_ranks // self.device_block_size_factor
+        )
         self.offload_logical_blocks_capacity = int(
             int(cpu_bytes_to_use) // bytes_per_block_all_ranks
         )
@@ -2577,6 +2773,12 @@ class TPURaidenStoreOffloadingSpec(OffloadingSpec):
                     ),
                     dict(storage.properties) or "none",
                 )
+            kv_cache_specs = {
+                group.group_id: self.kv_cache_config.kv_cache_groups[
+                    group.group_id
+                ].kv_cache_spec
+                for group in self.config.groups
+            }
             self._manager = RaidenOffloadingManager(
                 kernel_physical_blocks_capacity=self.kernel_physical_blocks_capacity,
                 offload_logical_blocks_capacity=self.offload_logical_blocks_capacity,
@@ -2589,6 +2791,18 @@ class TPURaidenStoreOffloadingSpec(OffloadingSpec):
                 kv_pool_group=self.kv_pool_group,
                 key_namespace=self.key_namespace,
                 secondary_backend_configs=secondary_backend_configs,
+                bytes_per_sub_block=self.bytes_per_sub_block,
+                tokens_per_chunk_by_group={
+                    group.group_id: group.tokens_per_block * self.blocks_per_chunk
+                    for group in self.config.groups
+                },
+                mamba_group_ids={
+                    group_id
+                    for group_id, kv_cache_spec in kv_cache_specs.items()
+                    if isinstance(kv_cache_spec, MambaSpec)
+                },
+                saved_tokens_group=select_saved_tokens_group(kv_cache_specs),
+                storage_backend=storage.storage_type if storage is not None else None,
             )
         return self._manager
 

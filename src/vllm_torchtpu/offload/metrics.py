@@ -30,10 +30,11 @@ from __future__ import annotations
 
 import copy
 import enum
+import itertools
 import time
 from collections import Counter
 from collections.abc import Callable, Collection, Iterable, Mapping, Sequence
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Any
 
 from vllm.config import VllmConfig
@@ -45,6 +46,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1.offloading.metrics import (
     OffloadingConnectorStats,
     OffloadPromMetrics,
 )
+from vllm.v1.kv_cache_interface import FullAttentionSpec, KVCacheSpec, MambaSpec
 from vllm.v1.kv_offload.base import (
     OffloadingCounterMetadata,
     OffloadingHistogramMetadata,
@@ -54,19 +56,19 @@ from vllm.v1.kv_offload.base import (
     ReqContext,
     get_offload_group_idx,
 )
-from vllm.v1.kv_offload.factory import OffloadingSpecFactory
 from vllm.v1.metrics.cache_hit_source import CacheHitSource
 
 from vllm_torchtpu.logger import init_logger
 
 logger = init_logger(__name__)
 
-_registered_specs: set[str] = set()
-
 
 # Load/hit metrics label where data is read from (`source`), while save metrics
 # label where data is written to (`destination`), keeping `source` aligned with
-# upstream `vllm:prompt_tokens_cached_by_source` for PromQL rollups.
+# upstream `vllm:prompt_tokens_cached_by_source` for PromQL rollups. `backend`
+# names what serves the tier: `dram` for host, `rdma` for p2p, and the
+# configured storage type for disk, so a new storage backend adds label values
+# rather than metrics.
 OFFLOAD_LOAD_LABELNAMES: tuple[str, str] = ("source", "backend")
 OFFLOAD_SAVE_LABELNAMES: tuple[str, str] = ("destination", "backend")
 UNKNOWN_BACKEND_LABEL = "unknown"
@@ -79,8 +81,14 @@ UNSPECIFIED_OFFLOAD_LABELS: tuple[str, str] = (
     UNKNOWN_BACKEND_LABEL,
 )
 
-# Covers sub-millisecond local DRAM DMAs (~250 us) up to multi-second peer RDMA
-# or shared-storage reads under load.
+# Coalesced `(source, sub_block_count)` pairs for a single `OffloadKey` whose
+# counts sum to `device_block_size_factor` (e.g. `((CacheHitSource.HOST, 64),)`
+# for a uniform 64-sub-block key).
+SubBlockSourceCounts = tuple[tuple[CacheHitSource, int], ...]
+
+# Completion is observed once per scheduler step, so the sub-millisecond buckets
+# only fill when steps run faster than the transfer (an otherwise idle engine);
+# the upper buckets cover peer and storage reads under load.
 OFFLOAD_LATENCY_BUCKETS: tuple[float, ...] = (
     0.00025,
     0.0005,
@@ -106,8 +114,8 @@ class RaidenOffloadMetricName(enum.StrEnum):
     HIT_TOKENS = "vllm:kv_offload_hit_tokens"
     LOADED_TOKENS = "vllm:kv_offload_loaded_tokens"
     SAVED_TOKENS = "vllm:kv_offload_saved_tokens"
-    LOAD_LATENCY = "vllm:kv_offload_load_latency_seconds"
-    SAVE_LATENCY = "vllm:kv_offload_save_latency_seconds"
+    LOAD_OBSERVED_LATENCY = "vllm:kv_offload_load_observed_latency_seconds"
+    SAVE_OBSERVED_LATENCY = "vllm:kv_offload_save_observed_latency_seconds"
     FAILED_LOAD_JOBS = "vllm:kv_offload_failed_load_jobs"
     FAILED_SAVE_JOBS = "vllm:kv_offload_failed_save_jobs"
 
@@ -119,6 +127,10 @@ class OffloadTransferMetricName(enum.StrEnum):
     `TransferResult`s, which Raiden never emits because transfers are driven by
     the scheduler-side controller. Recording these keys in
     `OffloadingConnectorStats` lets `OffloadPromMetrics` observe them directly.
+
+    Raiden records one sample per job: bytes summed over every worker rank, and
+    time from launch until a scheduler step observes completion, so `*_TIME` is
+    rounded up to engine steps like the observed-latency histograms.
     """
 
     LOAD_BYTES = "vllm:kv_offload_load_bytes"
@@ -139,7 +151,8 @@ def build_raiden_offload_metric_definitions(
             documentation=(
                 "Number of prompt tokens matched and pinned in external KV "
                 "offload tiers at scheduler admission, labeled by source and "
-                "backend."
+                "backend. Unlike vllm:prompt_tokens_cached_by_source, splits "
+                "disk hits by storage backend and counts only pinned tokens."
             ),
             labelnames=OFFLOAD_LOAD_LABELNAMES,
         ),
@@ -152,24 +165,30 @@ def build_raiden_offload_metric_definitions(
         ),
         RaidenOffloadMetricName.SAVED_TOKENS: OffloadingCounterMetadata(
             documentation=(
-                "Number of KV cache tokens successfully saved from device HBM "
-                "to external offload tiers, labeled by destination and backend."
+                "Number of prompt tokens whose KV cache was successfully saved "
+                "from device HBM to external offload tiers, counted once across "
+                "KV cache groups, labeled by destination and backend."
             ),
             labelnames=OFFLOAD_SAVE_LABELNAMES,
         ),
-        RaidenOffloadMetricName.LOAD_LATENCY: OffloadingHistogramMetadata(
+        RaidenOffloadMetricName.LOAD_OBSERVED_LATENCY: OffloadingHistogramMetadata(
             documentation=(
-                "End-to-end KV offload load job latency from transfer launch "
-                "to polled completion in seconds, labeled by source and backend."
+                "Seconds from launching a KV offload load until the scheduler "
+                "observes each tier's last sub-block land, labeled by source "
+                "and backend. Completion is polled once per scheduler step, so "
+                "values are rounded up to the next step (at least one forward "
+                "pass while a batch runs)."
             ),
             labelnames=OFFLOAD_LOAD_LABELNAMES,
             buckets=OFFLOAD_LATENCY_BUCKETS,
         ),
-        RaidenOffloadMetricName.SAVE_LATENCY: OffloadingHistogramMetadata(
+        RaidenOffloadMetricName.SAVE_OBSERVED_LATENCY: OffloadingHistogramMetadata(
             documentation=(
-                "End-to-end KV offload save job latency from transfer launch "
-                "to polled completion in seconds, labeled by destination and "
-                "backend."
+                "Seconds from launching a KV offload save until the scheduler "
+                "observes it commit, including retries, labeled by destination "
+                "and backend. Completion is polled once per scheduler step, so "
+                "values are rounded up to the next step (at least one forward "
+                "pass while a batch runs)."
             ),
             labelnames=OFFLOAD_SAVE_LABELNAMES,
             buckets=OFFLOAD_LATENCY_BUCKETS,
@@ -191,18 +210,25 @@ def build_raiden_offload_metric_definitions(
     }
 
 
-def _ensure_spec_registered(spec_cls: type[OffloadingSpec]) -> str:
-    """Idempotently register `spec_cls` in upstream `OffloadingSpecFactory`."""
-    spec_name = spec_cls.__name__
-    if spec_name in _registered_specs:
-        return spec_name
-    OffloadingSpecFactory.register_spec(
-        spec_name,
-        spec_cls.__module__,
-        spec_name,
-    )
-    _registered_specs.add(spec_name)
-    return spec_name
+def select_saved_tokens_group(kv_cache_specs: Mapping[int, KVCacheSpec]) -> int | None:
+    """Pick the KV cache group whose store keys count `saved_tokens`.
+
+    Groups save the same prompt tokens in separate store jobs (recurrent
+    boundary states in `align` mode, sliding-window tails), so counting every
+    group credits a token once per group. Full attention stores every prompt
+    chunk, so it is preferred, then any non-recurrent group.
+    """
+    full_attention = [
+        group
+        for group, spec in kv_cache_specs.items()
+        if isinstance(spec, FullAttentionSpec)
+    ]
+    non_recurrent = [
+        group
+        for group, spec in kv_cache_specs.items()
+        if not isinstance(spec, MambaSpec)
+    ]
+    return min(full_attention or non_recurrent or list(kv_cache_specs), default=None)
 
 
 class RaidenOffloadPromMetrics(OffloadPromMetrics):
@@ -212,9 +238,10 @@ class RaidenOffloadPromMetrics(OffloadPromMetrics):
     directly (bypassing `OffloadingSpecFactory`), whereas upstream
     `OffloadPromMetrics.__init__` in the API server process resolves
     `spec_cls.build_metric_definitions` via `OffloadingSpecFactory` using
-    `kv_connector_extra_config["spec_name"]`. This subclass registers `spec_cls`
-    and injects `spec_name` on shallow config copies so the caller's
-    `VllmConfig` and `KVTransferConfig` are never mutated.
+    `kv_connector_extra_config["spec_name"]`. This subclass names `spec_cls` as
+    an out-of-tree spec (`spec_name` + `spec_module_path`) on shallow config
+    copies, so neither the factory registry nor the caller's `VllmConfig` and
+    `KVTransferConfig` are mutated.
     """
 
     def __init__(
@@ -226,13 +253,13 @@ class RaidenOffloadPromMetrics(OffloadPromMetrics):
         *,
         spec_cls: type[OffloadingSpec],
     ):
-        spec_name = _ensure_spec_registered(spec_cls)
         kv_transfer_config = vllm_config.kv_transfer_config
         assert kv_transfer_config is not None
         scoped_transfer_config = copy.copy(kv_transfer_config)
         scoped_transfer_config.kv_connector_extra_config = {
             **kv_transfer_config.kv_connector_extra_config,
-            "spec_name": spec_name,
+            "spec_name": spec_cls.__name__,
+            "spec_module_path": spec_cls.__module__,
         }
         scoped_vllm_config = copy.copy(vllm_config)
         scoped_vllm_config.kv_transfer_config = scoped_transfer_config
@@ -275,42 +302,85 @@ def filter_positive_source_tokens(
     }
 
 
+def split_external_hit(
+    tokens_by_source: Mapping[CacheHitSource, int], num_external_tokens: int
+) -> dict[CacheHitSource, int]:
+    """Complete a per-tier hit split so it sums to `num_external_tokens`.
+
+    Upstream `PrefixCacheStats.record` replaces any split that does not sum to
+    the hit count with all-`external_unspecified`. Tokens no tier supplied
+    (spans no loaded key covers, such as omitted sliding-window history) are
+    reported as `EXTERNAL_UNSPECIFIED` so the known tiers survive.
+    """
+    split = dict(tokens_by_source)
+    unattributed = num_external_tokens - sum(split.values())
+    if unattributed > 0:
+        unspecified = CacheHitSource.EXTERNAL_UNSPECIFIED
+        split[unspecified] = split.get(unspecified, 0) + unattributed
+    return split
+
+
 def compute_store_key_token_ranges(
     keys: Iterable[OffloadKey],
     req_context: ReqContext,
-    tokens_per_chunk_by_group: Mapping[int, int],
+    *,
+    group_idx: int,
+    tokens_per_chunk: int,
 ) -> dict[OffloadKey, tuple[int, int]]:
-    """Derive `[start_token, end_token)` spans for candidate store keys.
+    """Derive `[start_token, end_token)` spans for `group_idx`'s store keys.
 
     `req_context.get_offload_key_position(key)` records the 1-based exclusive
     end token boundary of `key`; rounding `(end_token - 1)` down to a multiple
     of `tokens_per_chunk` recovers the chunk's `start_token`, handling both full
-    blocks and partial-tail boundary keys.
+    blocks and partial-tail boundary keys. Keys of other groups get no span.
     """
     ranges: dict[OffloadKey, tuple[int, int]] = {}
-    if not tokens_per_chunk_by_group:
-        return ranges
     for key in keys:
+        if get_offload_group_idx(key) != group_idx:
+            continue
         end_token = req_context.get_offload_key_position(key)
         if end_token is None or end_token <= 0:
             continue
-        group_idx = get_offload_group_idx(key)
-        tokens_per_chunk = tokens_per_chunk_by_group.get(group_idx)
-        if tokens_per_chunk is None or tokens_per_chunk <= 0:
-            continue
         start_token = ((end_token - 1) // tokens_per_chunk) * tokens_per_chunk
-        if start_token < end_token:
-            ranges[key] = (start_token, end_token)
+        ranges[key] = (start_token, end_token)
+    return ranges
+
+
+def saved_sub_block_ranges(
+    key_range: tuple[int, int],
+    saved: Sequence[bool],
+    tokens_per_chunk: int,
+    *,
+    atomic: bool,
+) -> list[tuple[int, int]]:
+    """Token ranges of a chunk-aligned `key_range` that its saved sub-blocks hold.
+
+    `saved[i]` says whether sub-block `i` was written by this save (the others
+    were already host-resident). An attention sub-block holds
+    `tokens_per_chunk // len(saved)` consecutive tokens. A recurrent (`atomic`)
+    state, or a chunk that does not split evenly, is credited whole once any of
+    its sub-blocks is saved.
+    """
+    if all(saved):
+        return [key_range]
+    if atomic or tokens_per_chunk % len(saved):
+        return [key_range] if any(saved) else []
+    lo, hi = key_range
+    tokens_per_sub = tokens_per_chunk // len(saved)
+    ranges: list[tuple[int, int]] = []
+    offset = 0
+    for is_saved, run in itertools.groupby(saved):
+        run_len = sum(1 for _ in run)
+        run_lo = lo + offset * tokens_per_sub
+        run_hi = min(hi, run_lo + run_len * tokens_per_sub)
+        if is_saved and run_lo < run_hi:
+            ranges.append((run_lo, run_hi))
+        offset += run_len
     return ranges
 
 
 def count_merged_tokens(ranges: Iterable[tuple[int, int]]) -> int:
-    """Count unique covered tokens across potentially overlapping intervals.
-
-    Multi-group and hybrid models emit separate store keys per KV cache group
-    for the same prompt span `[lo, hi)`; merging intervals prevents counting the
-    same saved prompt tokens once per group.
-    """
+    """Count unique covered tokens across potentially overlapping intervals."""
     intervals = sorted((lo, hi) for lo, hi in ranges if lo < hi)
     if not intervals:
         return 0
@@ -327,69 +397,76 @@ def count_merged_tokens(ranges: Iterable[tuple[int, int]]) -> int:
     return total
 
 
+@dataclass(slots=True, eq=False)
+class _TierProgress:
+    """Completion state of the sub-hashes one load job reads from one tier."""
+
+    source: CacheHitSource
+    left: int = 0
+    completed_at: float | None = None
+    failed: bool = False
+
+
 @dataclass
 class LoadTimingState:
-    """Per-job transfer timing and source attribution state for an active load.
+    """Per-tier completion and failure state for one active load job.
 
-    A single load job can read from multiple tiers in parallel (`store.load()`
-    for `HOST` DRAM and `store.read_remote()` for `P2P` RDMA + `DISK` storage),
-    and Raiden reports completion per `sub_hash`. Tracking `pending_by_source`
-    independently per tier lets each tier stamp its own completion latency as
-    soon as its last `sub_hash` finishes, without waiting for slower tiers in
-    the same job, and isolates `failed_sources` to the failing tier(s).
+    A load reads from several tiers in parallel (`store.load()` for host DRAM,
+    `store.read_remote()` for peers and storage), and Raiden reports completion
+    per sub-hash. Each tier stamps its completion when its last sub-hash lands,
+    without waiting for slower tiers, and a failure is blamed only on the
+    tier(s) that failed.
+
+    Callers report each sub-hash at most once, while it is still pending in its
+    `Admission`, so a tier counts its unresolved sub-hashes rather than
+    duplicating the admission's pending set.
     """
 
     started_at: float
-    sub_hash_source: dict[bytes, CacheHitSource]
-    pending_by_source: dict[CacheHitSource, set[bytes]]
+    host: _TierProgress
+    remote_tiers: tuple[_TierProgress, ...]
+    # Tier of each sub-hash read via `read_remote()`; every other sub-hash is a
+    # host DRAM load.
+    remote: dict[bytes, _TierProgress]
     tokens_by_source: dict[CacheHitSource, int]
     num_sub_hashes: int
-    completed_at_by_source: dict[CacheHitSource, float] = field(default_factory=dict)
-    failed_sources: set[CacheHitSource] = field(default_factory=set)
 
-    def mark_launch_failed(
-        self,
-        failed_hashes: Iterable[bytes],
-        *,
-        unlaunched_hashes: Iterable[bytes] = (),
-    ) -> None:
-        """Record sub-hashes whose transfer launch failed synchronously."""
-        for sub_hash in failed_hashes:
-            source = self.sub_hash_source.get(sub_hash)
-            if source is None:
-                continue
-            self.failed_sources.add(source)
-            self.pending_by_source[source].discard(sub_hash)
-            self.completed_at_by_source.pop(source, None)
-        # If `store.load()` fails before `store.read_remote()` is called, drop
-        # `unlaunched_hashes` from pending without blaming their remote tier.
-        for sub_hash in unlaunched_hashes:
-            source = self.sub_hash_source.get(sub_hash)
-            if source is not None:
-                self.pending_by_source[source].discard(sub_hash)
+    @property
+    def tiers(self) -> tuple[_TierProgress, ...]:
+        return tuple(dict.fromkeys((self.host, *self.remote_tiers)))
+
+    def mark_local_launch_failed(self) -> None:
+        """`store.load()` refused the job's host DRAM batch.
+
+        `read_remote()` is then never called, so the remote tiers are not
+        blamed.
+        """
+        self.host.failed = True
+
+    def mark_remote_launch_failed(self) -> None:
+        """`store.read_remote()` refused the job's peer and storage batch."""
+        for tier in self.remote_tiers:
+            tier.failed = True
+
+    def mark_poisoned(self) -> None:
+        """Blame the tiers still in flight when `drain_jobs` timed out."""
+        for tier in self.tiers:
+            if tier.left:
+                tier.failed = True
 
     def on_sub_hash_done(self, sub_hash: bytes, now: float) -> None:
-        """Mark one sub-hash transfer done and stamp source completion if last."""
-        source = self.sub_hash_source.get(sub_hash)
-        if source is None:
-            return
-        remaining = self.pending_by_source.get(source)
-        if remaining is None or sub_hash not in remaining:
-            return
-        remaining.discard(sub_hash)
-        if not remaining and source not in self.failed_sources:
-            self.completed_at_by_source[source] = now
+        """Count one landed sub-hash; stamp its tier's completion if last."""
+        tier = self.remote.get(sub_hash, self.host)
+        tier.left -= 1
+        if not tier.left and not tier.failed:
+            tier.completed_at = now
 
     def on_sub_hash_failed(self, sub_hash: bytes) -> None:
-        """Mark one sub-hash's source as failed on polled transfer error."""
-        source = self.sub_hash_source.get(sub_hash)
-        if source is None:
-            return
-        self.failed_sources.add(source)
-        remaining = self.pending_by_source.get(source)
-        if remaining is not None:
-            remaining.discard(sub_hash)
-        self.completed_at_by_source.pop(source, None)
+        """Count one failed sub-hash and blame its tier."""
+        tier = self.remote.get(sub_hash, self.host)
+        tier.left -= 1
+        tier.failed = True
+        tier.completed_at = None
 
 
 @dataclass
@@ -415,10 +492,10 @@ class RaidenOffloadStatsCollector:
         self._storage_backend = storage_backend
         self._clock = clock
         self._stats = OffloadingConnectorStats()
-        # Single-step map of OffloadKey -> per-sub-block CacheHitSources:
-        # populated in `record_lookup_hit`, updated with pinned residency in
-        # `record_prepared_load`, and cleared in `on_schedule_end()`.
-        self._step_key_sources: dict[OffloadKey, tuple[CacheHitSource, ...]] = {}
+        # Single-step map of OffloadKey -> coalesced `(source, count)` pairs:
+        # populated from pinned residency in `record_prepared_load` and cleared
+        # in `on_schedule_end()`.
+        self._step_key_sources: dict[OffloadKey, SubBlockSourceCounts] = {}
 
     def now(self) -> float:
         if self._clock is not None:
@@ -426,7 +503,13 @@ class RaidenOffloadStatsCollector:
         return time.monotonic()
 
     def source_labels(self, source: CacheHitSource) -> tuple[str, str]:
-        """Map an external `CacheHitSource` to `(source, backend)` labels."""
+        """Map an external `CacheHitSource` to `(source, backend)` labels.
+
+        Assumes one storage backend per engine: Raiden's `SHARED_STORAGE`
+        status does not say which backend holds a block, so serving one engine
+        from several storage backends needs Raiden to report the backend per
+        block.
+        """
         # Reject raw `str` before `==` checks since `CacheHitSource` is a `str`.
         if not isinstance(source, CacheHitSource):
             raise ValueError(f"Unsupported offload source for metrics: {source!r}")
@@ -452,7 +535,8 @@ class RaidenOffloadStatsCollector:
 
         When secondary storage is configured, Raiden `KVCacheStore::Save()`
         writes through `HBM -> Host DRAM -> Shared Storage` atomically and only
-        marks `poll_save_status()` done once storage commits.
+        marks `poll_save_status()` done once storage commits. Revisit this for
+        a storage backend that completes saves before its storage commits.
         """
         if self._storage_backend is not None:
             return (CacheHitSource.DISK.value, self._storage_backend)
@@ -471,20 +555,6 @@ class RaidenOffloadStatsCollector:
             )
         return source
 
-    def record_lookup_hit(
-        self,
-        key: OffloadKey,
-        matches: Sequence[tuple[bytes, Any]],
-        block_status_cls: Any,
-    ) -> None:
-        """Record per-sub-block sources that answered `lookup()` for `key`."""
-        if not matches:
-            return
-        self._step_key_sources[key] = tuple(
-            self._resolve_block_source(block.status, block_status_cls)
-            for _, block in matches
-        )
-
     def record_prepared_load(
         self,
         keys: Sequence[OffloadKey],
@@ -493,36 +563,64 @@ class RaidenOffloadStatsCollector:
         sub_hashes: Sequence[bytes],
         block_status_cls: Any,
     ) -> None:
-        """Refresh per-key sub-block sources from `prepare_load` residency.
+        """Record coalesced per-key `(source, count)` pairs from `prepare_load`.
 
-        Between `lookup()` and `prepare_load()`, a remote/disk sub-block may be
-        promoted into local `HOST` DRAM; `remote_slices` contains only the
-        sub-hashes that remain non-local after pinning.
+        `remote_slices` contains only the sub-hashes that remain non-local after
+        pinning (any sub-hash promoted to local `HOST` DRAM before `prepare_load`
+        is absent from `remote_slices`). Consecutive sub-blocks sharing a tier
+        are coalesced into `(source, count)` pairs so uniform keys allocate a
+        1-element tuple regardless of `device_block_size_factor`.
         """
+        if not keys or device_block_size_factor <= 0:
+            return
+        if not remote_slices:
+            # Fast path when every pinned sub-block is resident in local HOST
+            # DRAM: share one 1-element tuple across all keys without scanning
+            # `sub_hashes`.
+            uniform_host: SubBlockSourceCounts = (
+                (CacheHitSource.HOST, device_block_size_factor),
+            )
+            for key in keys:
+                self._step_key_sources[key] = uniform_host
+            return
+
+        num_hashes = len(sub_hashes)
+        resolved: dict[Any, CacheHitSource] = {}
         for idx, key in enumerate(keys):
             start = idx * device_block_size_factor
-            end = start + device_block_size_factor
-            key_sources: list[CacheHitSource] = []
-            for sub_hash in sub_hashes[start:end]:
-                remote_block = remote_slices.get(sub_hash)
+            end = min(start + device_block_size_factor, num_hashes)
+            source_counts: list[tuple[CacheHitSource, int]] = []
+            cur_source: CacheHitSource | None = None
+            cur_count = 0
+            for pos in range(start, end):
+                remote_block = remote_slices.get(sub_hashes[pos])
                 if remote_block is None:
-                    key_sources.append(CacheHitSource.HOST)
+                    source = CacheHitSource.HOST
                 else:
-                    key_sources.append(
-                        self._resolve_block_source(
-                            remote_block.status, block_status_cls
+                    source = resolved.get(remote_block.status)
+                    if source is None:
+                        source = resolved[remote_block.status] = (
+                            self._resolve_block_source(
+                                remote_block.status, block_status_cls
+                            )
                         )
-                    )
-            if key_sources:
-                self._step_key_sources[key] = tuple(key_sources)
+                if source == cur_source:
+                    cur_count += 1
+                else:
+                    if cur_source is not None:
+                        source_counts.append((cur_source, cur_count))
+                    cur_source = source
+                    cur_count = 1
+            if cur_source is not None:
+                source_counts.append((cur_source, cur_count))
+            if source_counts:
+                self._step_key_sources[key] = tuple(source_counts)
 
-    def get_load_sub_sources(
-        self, key: OffloadKey
-    ) -> tuple[CacheHitSource, ...] | None:
-        """Return recorded per-sub-block sources for `key`, or `None` on miss."""
-        sub_sources = self._step_key_sources.get(key)
-        if sub_sources:
-            return sub_sources
+    def get_load_sub_sources(self, key: OffloadKey) -> SubBlockSourceCounts | None:
+        """Return coalesced `(source, count)` pairs for `key`, or `None` on miss."""
+        source_counts = self._step_key_sources.get(key)
+        if source_counts:
+            return source_counts
         logger.warning_once(
             "TPURaidenOffloadingConnector: offload key missed step source cache; "
             "skipping offload metric attribution for unrecorded key."
@@ -540,10 +638,13 @@ class RaidenOffloadStatsCollector:
     ) -> dict[CacheHitSource, int]:
         """Compute deduplicated external token counts at sub-block granularity.
 
-        Phase 1 converts each key's clipped `[lo, hi)` span into interval events:
-        - Attention keys store K/V vectors per token, so `[lo, hi)` is split
-          across `device_block_size_factor` sub-blocks (`tokens_per_sub` each),
-          preserving exact `HOST` / `P2P` / `DISK` ratios within a mixed key.
+        Phase 1 converts each key's clipped `[lo, hi)` span into interval events
+        from its coalesced `(source, count)` pairs:
+        - Uniform keys (`len(source_counts) == 1`) emit a single `[lo, hi)`
+          interval in O(1) regardless of `device_block_size_factor`.
+        - Mixed Attention keys split `[lo, hi)` across `(source, count)` pairs
+          (`count * tokens_per_sub` tokens each), preserving exact `HOST` /
+          `P2P` / `DISK` ratios without iterating individual sub-blocks.
         - Recurrent (`MambaSpec`) keys slice a single state checkpoint by bytes
           rather than token positions; all byte slices are needed together to
           restore that checkpoint, so `[lo, hi)` uses `CacheHitSource.outermost`.
@@ -554,7 +655,8 @@ class RaidenOffloadStatsCollector:
         to deduplicate overlapping ranges emitted by multi-group / hybrid models
         for the same prompt tokens, attributing shared spans via
         `CacheHitSource.outermost` (the slowest tier required to materialize the
-        span).
+        span). Tokens no recorded key covers are left out; `split_external_hit`
+        reports them to upstream as `EXTERNAL_UNSPECIFIED`.
         """
         if end_token <= start_token:
             return {}
@@ -567,29 +669,36 @@ class RaidenOffloadStatsCollector:
             hi = min(end_token, raw_hi)
             if lo >= hi:
                 continue
-            sub_sources = self.get_load_sub_sources(key)
-            if sub_sources is None:
+            source_counts = self.get_load_sub_sources(key)
+            if source_counts is None:
                 continue
+            if len(source_counts) == 1:
+                only_source = source_counts[0][0]
+                events.extend(((lo, 1, only_source), (hi, -1, only_source)))
+                continue
+
             group_idx = get_offload_group_idx(key)
             tokens_per_chunk = tokens_per_chunk_by_group.get(group_idx, 0)
-            num_sub = len(sub_sources)
+            num_sub = sum(count for _, count in source_counts)
             if (
                 group_idx in mamba_group_ids
                 or num_sub <= 1
                 or tokens_per_chunk <= 0
                 or tokens_per_chunk % num_sub != 0
             ):
-                source = CacheHitSource.outermost(sub_sources)
+                source = CacheHitSource.outermost(src for src, _ in source_counts)
                 events.extend(((lo, 1, source), (hi, -1, source)))
                 continue
 
             tokens_per_sub = tokens_per_chunk // num_sub
             chunk_start = (lo // tokens_per_chunk) * tokens_per_chunk
-            for sub_idx, source in enumerate(sub_sources):
-                sub_lo = max(lo, chunk_start + sub_idx * tokens_per_sub)
-                sub_hi = min(hi, chunk_start + (sub_idx + 1) * tokens_per_sub)
-                if sub_lo < sub_hi:
-                    events.extend(((sub_lo, 1, source), (sub_hi, -1, source)))
+            sub_offset = 0
+            for source, count in source_counts:
+                span_lo = max(lo, chunk_start + sub_offset * tokens_per_sub)
+                sub_offset += count
+                span_hi = min(hi, chunk_start + sub_offset * tokens_per_sub)
+                if span_lo < span_hi:
+                    events.extend(((span_lo, 1, source), (span_hi, -1, source)))
 
         if not events:
             return {}
@@ -642,20 +751,25 @@ class RaidenOffloadStatsCollector:
         block_status_cls: Any,
         tokens_by_source: Mapping[CacheHitSource, int] | None = None,
     ) -> LoadTimingState:
-        """Initialize per-source timing state for a load job about to launch."""
-        sub_hash_source: dict[bytes, CacheHitSource] = {}
-        pending_by_source: dict[CacheHitSource, set[bytes]] = {}
-        for sub_hash in local_hashes:
-            sub_hash_source[sub_hash] = CacheHitSource.HOST
-            pending_by_source.setdefault(CacheHitSource.HOST, set()).add(sub_hash)
+        """Initialize per-tier timing state for a load job about to launch."""
+        host = _TierProgress(CacheHitSource.HOST, left=len(local_hashes))
+        tiers = {CacheHitSource.HOST: host}
+        tier_by_status: dict[Any, _TierProgress] = {}
+        remote: dict[bytes, _TierProgress] = {}
         for sub_hash, block in zip(remote_hashes, remote_slices):
-            source = self._resolve_block_source(block.status, block_status_cls)
-            sub_hash_source[sub_hash] = source
-            pending_by_source.setdefault(source, set()).add(sub_hash)
+            tier = tier_by_status.get(block.status)
+            if tier is None:
+                source = self._resolve_block_source(block.status, block_status_cls)
+                tier = tier_by_status[block.status] = tiers.setdefault(
+                    source, _TierProgress(source)
+                )
+            tier.left += 1
+            remote[sub_hash] = tier
         return LoadTimingState(
             started_at=self.now(),
-            sub_hash_source=sub_hash_source,
-            pending_by_source=pending_by_source,
+            host=host,
+            remote_tiers=tuple(dict.fromkeys(tier_by_status.values())),
+            remote=remote,
             tokens_by_source=(
                 filter_positive_source_tokens(tokens_by_source)
                 if tokens_by_source
@@ -666,30 +780,28 @@ class RaidenOffloadStatsCollector:
 
     def on_load_finalized(
         self,
-        timing: LoadTimingState | None,
+        timing: LoadTimingState,
         *,
         success: bool,
         poisoned: bool = False,
         now: float | None = None,
     ) -> None:
         """Emit load token, latency, failure, and byte/time/size metrics."""
-        if timing is None:
-            if not success:
-                logger.warning_once(
-                    "TPURaidenOffloadingConnector: load job finalized without "
-                    "timing state; skipping failed_load_jobs attribution."
-                )
-            return
         finish_time = self.now() if now is None else now
+        tiers = timing.tiers
+        completed = [
+            (tier.source, completed_at)
+            for tier in tiers
+            if (completed_at := tier.completed_at) is not None
+        ]
         # Emit per-tier latencies before checking `success` so healthy tiers in
-        # a partially failed job still record their transfer duration. Poisoned
-        # jobs timed out in `drain_jobs` while reclaiming HBM and are excluded.
+        # a partially failed job still record their transfer duration. Failed
+        # tiers never stamp a completion. Poisoned jobs timed out in
+        # `drain_jobs` while reclaiming HBM and are excluded.
         if not poisoned:
-            for source, completed_at in timing.completed_at_by_source.items():
-                if source in timing.failed_sources:
-                    continue
+            for source, completed_at in completed:
                 self._stats.observe_histogram(
-                    RaidenOffloadMetricName.LOAD_LATENCY,
+                    RaidenOffloadMetricName.LOAD_OBSERVED_LATENCY,
                     max(0.0, completed_at - timing.started_at),
                     labelvalues=self.source_labels(source),
                 )
@@ -706,7 +818,8 @@ class RaidenOffloadStatsCollector:
             if self._bytes_per_sub_block > 0 and timing.num_sub_hashes > 0:
                 total_bytes = timing.num_sub_hashes * self._bytes_per_sub_block
                 end_time = max(
-                    timing.completed_at_by_source.values(), default=finish_time
+                    (completed_at for _, completed_at in completed),
+                    default=finish_time,
                 )
                 duration = max(0.0, end_time - timing.started_at)
                 self._stats.increase_counter(
@@ -720,25 +833,16 @@ class RaidenOffloadStatsCollector:
                 )
             return
 
-        # Blame only the tier(s) whose transfers failed (or were still in flight
-        # when `drain_jobs` poisoned the admission on timeout).
-        failed_sources = set(timing.failed_sources)
-        if poisoned:
-            unfinished = {
-                source
-                for source, pending in timing.pending_by_source.items()
-                if pending
-            }
-            failed_sources.update(unfinished or set(timing.sub_hash_source.values()))
-        if not failed_sources:
-            failed_sources.update(timing.sub_hash_source.values())
+        # Blame only the tier(s) whose transfers failed, or that were still in
+        # flight when `drain_jobs` poisoned the job (`mark_poisoned`).
+        failed_sources = [tier.source for tier in tiers if tier.failed]
         if not failed_sources:
             logger.warning_once(
-                "TPURaidenOffloadingConnector: failed load job had no recorded "
-                "sub-block sources; attributing failed_load_jobs to (%r, %r).",
+                "TPURaidenOffloadingConnector: failed load job had no failed "
+                "tier recorded; attributing failed_load_jobs to (%r, %r).",
                 *UNSPECIFIED_OFFLOAD_LABELS,
             )
-            failed_sources.add(CacheHitSource.EXTERNAL_UNSPECIFIED)
+            failed_sources = [CacheHitSource.EXTERNAL_UNSPECIFIED]
         for source in failed_sources:
             self._stats.increase_counter(
                 RaidenOffloadMetricName.FAILED_LOAD_JOBS,
@@ -746,51 +850,51 @@ class RaidenOffloadStatsCollector:
                 labelvalues=self.source_labels(source),
             )
 
-    def record_failed_save(self) -> None:
-        """Record a save job that failed before or during transfer."""
+    def record_failed_save(self, *, launched: bool) -> None:
+        """Count a failed save job.
+
+        A save that never launched (insert rejected, or `save()` refused) failed
+        in the host pool. A launched save writes through to storage when a
+        storage tier is configured, so its failure is labeled with the save
+        destination.
+        """
         self._stats.increase_counter(
             RaidenOffloadMetricName.FAILED_SAVE_JOBS,
             1,
-            labelvalues=self._save_destination_labels(),
+            labelvalues=(
+                self._save_destination_labels() if launched else HOST_OFFLOAD_LABELS
+            ),
         )
 
     def start_save_timing(
         self,
         *,
-        saved_keys: Iterable[OffloadKey],
+        saved_token_ranges: Iterable[tuple[int, int]],
         num_saved_sub_hashes: int,
-        key_token_ranges: Mapping[OffloadKey, tuple[int, int]] | None = None,
     ) -> SaveTimingState:
         """Initialize timing and deduplicated token count for an active save."""
-        saved_tokens = 0
-        if key_token_ranges:
-            saved_tokens = count_merged_tokens(
-                key_token_ranges[key] for key in saved_keys if key in key_token_ranges
-            )
         return SaveTimingState(
             started_at=self.now(),
-            saved_tokens=saved_tokens,
+            saved_tokens=count_merged_tokens(saved_token_ranges),
             num_sub_hashes=num_saved_sub_hashes,
         )
 
     def on_save_finalized(
         self,
-        timing: SaveTimingState | None,
+        timing: SaveTimingState,
         *,
         success: bool,
         now: float | None = None,
     ) -> None:
         """Emit save token, latency, failure, and byte/time/size metrics."""
         if not success:
-            self.record_failed_save()
-            return
-        if timing is None:
+            self.record_failed_save(launched=True)
             return
         finish_time = self.now() if now is None else now
         duration = max(0.0, finish_time - timing.started_at)
         destination_labels = self._save_destination_labels()
         self._stats.observe_histogram(
-            RaidenOffloadMetricName.SAVE_LATENCY,
+            RaidenOffloadMetricName.SAVE_OBSERVED_LATENCY,
             duration,
             labelvalues=destination_labels,
         )
