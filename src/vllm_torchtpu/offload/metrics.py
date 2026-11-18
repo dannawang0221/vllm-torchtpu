@@ -20,9 +20,9 @@ Host/Peer/Storage transfers from the scheduler-side `KVCacheStore` controller
 
 - `compute_load_tokens_by_source` runs in `EngineCore`, computing deduplicated
   token counts per tier for one offload hit.
-- `RaidenOffloadStatsCollector` runs in `EngineCore`, counting hit tokens per
-  tier and draining per-step deltas as `OffloadingConnectorStats` via
-  `pop_stats()`.
+- `RaidenOffloadStatsCollector` runs in `EngineCore`, counting hit tokens,
+  loaded tokens, load latencies, and failed load jobs per tier, and draining
+  per-step deltas as `OffloadingConnectorStats` via `pop_stats()`.
 - `RaidenOffloadPromMetrics` runs in the API server process, registering
   Raiden's `OffloadingSpec` metric definitions and applying IPC stats deltas to
   Prometheus counters and histograms.
@@ -32,8 +32,10 @@ from __future__ import annotations
 
 import copy
 import enum
+import time
 from collections import Counter
-from collections.abc import Collection, Iterable, Mapping
+from collections.abc import Callable, Collection, Iterable, Mapping
+from dataclasses import dataclass
 
 from vllm.config import VllmConfig
 from vllm.distributed.kv_transfer.kv_connector.v1.metrics import (
@@ -46,6 +48,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1.offloading.metrics import (
 )
 from vllm.v1.kv_offload.base import (
     OffloadingCounterMetadata,
+    OffloadingHistogramMetadata,
     OffloadingMetricMetadata,
     OffloadingSpec,
     OffloadKey,
@@ -81,11 +84,35 @@ def disk_offload_labels(storage_backend: str) -> tuple[str, str]:
 # disk, and a key entirely in host DRAM is `((HOST, 4),)`.
 SubBlockSourceCounts = tuple[tuple[CacheHitSource, int], ...]
 
+# Completion is observed once per scheduler step, so the sub-millisecond buckets
+# only fill when steps run faster than the transfer (an otherwise idle engine);
+# the upper buckets cover peer and storage reads under load.
+OFFLOAD_LATENCY_BUCKETS: tuple[float, ...] = (
+    0.00025,
+    0.0005,
+    0.001,
+    0.0025,
+    0.005,
+    0.01,
+    0.025,
+    0.05,
+    0.1,
+    0.25,
+    0.5,
+    1.0,
+    2.5,
+    5.0,
+    10.0,
+)
+
 
 class RaidenOffloadMetricName(enum.StrEnum):
     """Prometheus metrics emitted by Raiden KV offload."""
 
     HIT_TOKENS = "vllm:kv_offload_raiden_hit_tokens"
+    LOADED_TOKENS = "vllm:kv_offload_raiden_loaded_tokens"
+    LOAD_OBSERVED_LATENCY = "vllm:kv_offload_raiden_load_observed_latency_seconds"
+    FAILED_LOAD_JOBS = "vllm:kv_offload_raiden_failed_load_jobs"
 
 
 def build_raiden_offload_metric_definitions() -> dict[str, OffloadingMetricMetadata]:
@@ -101,7 +128,46 @@ def build_raiden_offload_metric_definitions() -> dict[str, OffloadingMetricMetad
             ),
             labelnames=SOURCE_LABELNAMES,
         ),
+        RaidenOffloadMetricName.LOADED_TOKENS: OffloadingCounterMetadata(
+            documentation=(
+                "Number of KV cache tokens successfully loaded into device HBM "
+                "from external offload tiers, labeled by source and backend."
+            ),
+            labelnames=SOURCE_LABELNAMES,
+        ),
+        RaidenOffloadMetricName.LOAD_OBSERVED_LATENCY: OffloadingHistogramMetadata(
+            documentation=(
+                "Seconds from launching a KV offload load until the scheduler "
+                "observes each tier's last sub-block land, labeled by source "
+                "and backend. Completion is polled once per scheduler step, so "
+                "values are rounded up to the next step (at least one forward "
+                "pass while a batch runs)."
+            ),
+            labelnames=SOURCE_LABELNAMES,
+            buckets=OFFLOAD_LATENCY_BUCKETS,
+        ),
+        RaidenOffloadMetricName.FAILED_LOAD_JOBS: OffloadingCounterMetadata(
+            documentation=(
+                "Number of KV offload load jobs that failed after prepare_load "
+                "accepted them, labeled by the source and backend of each tier "
+                "that failed."
+            ),
+            labelnames=SOURCE_LABELNAMES,
+        ),
     }
+
+
+def _add_unobserved_histogram(
+    stats: OffloadingConnectorStats, name: str, labelvalues: tuple[str, ...]
+) -> None:
+    """Add the `name` histogram series of `labelvalues` to `stats`, with no sample.
+
+    `OffloadingConnectorStats` adds a histogram series only together with a
+    sample, so record one and drop it.
+    """
+    stats.observe_histogram(name, 0.0, labelvalues=labelvalues)
+    _, values = stats.metric_sections()
+    values[name][labelvalues].clear()
 
 
 class RaidenOffloadPromMetrics(OffloadPromMetrics):
@@ -117,10 +183,10 @@ class RaidenOffloadPromMetrics(OffloadPromMetrics):
     `KVTransferConfig` are mutated.
 
     `configured_tier_labels` holds the `(source, backend)` labels of the tiers
-    the deployment enables. Each engine's `vllm:kv_offload_raiden_hit_tokens` series
-    for these tiers are created at 0 on startup. Prometheus counts a series
-    from the first value it scrapes, so `rate()` and `increase()` would miss
-    the first hit of a series that only appeared with that hit.
+    the deployment enables. Each engine's hit and load series for these tiers
+    are created at 0 on startup. Prometheus counts a series from the first
+    value it scrapes, so `rate()` and `increase()` would miss the first
+    increment of a series that only appeared with that increment.
     """
 
     def __init__(
@@ -149,13 +215,19 @@ class RaidenOffloadPromMetrics(OffloadPromMetrics):
             labelnames,
             per_engine_labelvalues,
         )
-        zero_hits = OffloadingConnectorStats()
+        zero_stats = OffloadingConnectorStats()
         for labelvalues in configured_tier_labels:
-            zero_hits.increase_counter(
-                RaidenOffloadMetricName.HIT_TOKENS, 0, labelvalues=labelvalues
+            for counter in (
+                RaidenOffloadMetricName.HIT_TOKENS,
+                RaidenOffloadMetricName.LOADED_TOKENS,
+                RaidenOffloadMetricName.FAILED_LOAD_JOBS,
+            ):
+                zero_stats.increase_counter(counter, 0, labelvalues=labelvalues)
+            _add_unobserved_histogram(
+                zero_stats, RaidenOffloadMetricName.LOAD_OBSERVED_LATENCY, labelvalues
             )
         for engine_idx in per_engine_labelvalues:
-            self.observe(zero_hits.data, engine_idx)
+            self.observe(zero_stats.data, engine_idx)
 
 
 def external_sources_with_tokens(
@@ -299,12 +371,95 @@ def compute_load_tokens_by_source(
     return external_sources_with_tokens(sources)
 
 
+@dataclass(slots=True)
+class _TierProgress:
+    """Completion state of the sub-hashes one load job reads from one tier."""
+
+    source: CacheHitSource
+    left: int = 0
+    completed_at: float | None = None
+    failed: bool = False
+
+
+@dataclass
+class LoadTimingState:
+    """Per-tier completion and failure state for one active load job.
+
+    A load reads from several tiers in parallel (`store.load()` for host DRAM,
+    `store.read_remote()` for peers and storage), and Raiden reports completion
+    per sub-hash. Each tier stamps its completion when its last sub-hash lands,
+    without waiting for slower tiers, and a failure is blamed only on the
+    tier(s) that failed.
+
+    Callers report each landed sub-hash at most once, while it is still pending
+    in its `Admission`, so a tier counts the sub-hashes that have not landed
+    rather than duplicating the admission's pending set.
+    """
+
+    started_at: float
+    host: _TierProgress
+    # `host`, then each tier that the job reads via `read_remote()`.
+    tiers: tuple[_TierProgress, ...]
+    # Tier of each sub-hash read via `read_remote()`; every other sub-hash is a
+    # host DRAM load.
+    remote: dict[bytes, _TierProgress]
+    tokens_by_source: dict[CacheHitSource, int]
+
+    def mark_local_launch_failed(self) -> None:
+        """`store.load()` refused the job's host DRAM batch.
+
+        `read_remote()` is then never called, so the remote tiers are not
+        blamed.
+        """
+        self.host.failed = True
+
+    def mark_remote_launch_failed(self, sub_hashes: Iterable[bytes]) -> None:
+        """`store.read_remote()` refused a batch of peer and storage reads.
+
+        `sub_hashes` are the refused batch plus every batch not yet launched;
+        their tiers are blamed, while batches already in flight report through
+        the poll as usual.
+        """
+        for sub_hash in sub_hashes:
+            self.remote[sub_hash].failed = True
+
+    def mark_poisoned(self) -> None:
+        """Blame the tiers still in flight when `drain_jobs` timed out."""
+        for tier in self.tiers:
+            if tier.left:
+                tier.failed = True
+
+    def on_sub_hash_done(self, sub_hash: bytes, now: float) -> None:
+        """Count one landed sub-hash; stamp its tier's completion if last."""
+        tier = self.remote.get(sub_hash, self.host)
+        tier.left -= 1
+        if not tier.left and not tier.failed:
+            tier.completed_at = now
+
+    def on_sub_hash_failed(self, sub_hash: bytes) -> None:
+        """Blame the tier of one failed sub-hash."""
+        tier = self.remote.get(sub_hash, self.host)
+        tier.failed = True
+        tier.completed_at = None
+
+
 class RaidenOffloadStatsCollector:
     """Scheduler-side collector producing `OffloadingConnectorStats` deltas."""
 
-    def __init__(self, *, storage_backend: str | None = None):
+    def __init__(
+        self,
+        *,
+        storage_backend: str | None = None,
+        clock: Callable[[], float] | None = None,
+    ):
         self._storage_backend = storage_backend
+        self._clock = clock
         self._stats = OffloadingConnectorStats()
+
+    def now(self) -> float:
+        if self._clock is not None:
+            return self._clock()
+        return time.monotonic()
 
     def source_labels(self, source: CacheHitSource) -> tuple[str, str]:
         """Map an external `CacheHitSource` to `(source, backend)` labels.
@@ -346,7 +501,8 @@ class RaidenOffloadStatsCollector:
 
         Matches upstream `Scheduler.schedule()`: re-admissions after preemption
         (`request.num_preemptions > 0`) skip `HIT_TOKENS` so per-request prefix
-        hits are not double-counted.
+        hits are not double-counted, whereas `LOADED_TOKENS` still counts every
+        completed physical reload into HBM.
         """
         if preempted:
             return
@@ -356,6 +512,83 @@ class RaidenOffloadStatsCollector:
                 count,
                 labelvalues=self.source_labels(source),
             )
+
+    def start_load_timing(
+        self,
+        *,
+        num_host_sub_hashes: int,
+        remote_sources: Mapping[bytes, CacheHitSource],
+        tokens_by_source: Mapping[CacheHitSource, int] | None = None,
+    ) -> LoadTimingState:
+        """Initialize per-tier timing state for a load job about to launch.
+
+        `remote_sources` has the tier of each sub-hash that the job reads via
+        `read_remote()`: `P2P` or `DISK`. The job's other
+        `num_host_sub_hashes` sub-hashes are host DRAM loads.
+        """
+        host = _TierProgress(CacheHitSource.HOST, left=num_host_sub_hashes)
+        tiers = {CacheHitSource.HOST: host}
+        remote: dict[bytes, _TierProgress] = {}
+        for sub_hash, source in remote_sources.items():
+            tier = tiers.get(source)
+            if tier is None:
+                tier = tiers[source] = _TierProgress(source)
+            tier.left += 1
+            remote[sub_hash] = tier
+        return LoadTimingState(
+            started_at=self.now(),
+            host=host,
+            tiers=tuple(tiers.values()),
+            remote=remote,
+            tokens_by_source=external_sources_with_tokens(tokens_by_source or {}),
+        )
+
+    def on_load_finalized(
+        self,
+        timing: LoadTimingState,
+        *,
+        success: bool,
+        poisoned: bool = False,
+    ) -> None:
+        """Emit load token, latency, and failure metrics."""
+        tiers = timing.tiers
+        completed = [
+            (tier.source, completed_at)
+            for tier in tiers
+            if (completed_at := tier.completed_at) is not None
+        ]
+        # Emit per-tier latencies before checking `success` so healthy tiers in
+        # a partially failed job still record their transfer duration. Failed
+        # tiers never stamp a completion. Poisoned jobs timed out in
+        # `drain_jobs` while reclaiming HBM and are excluded.
+        if not poisoned:
+            for source, completed_at in completed:
+                self._stats.observe_histogram(
+                    RaidenOffloadMetricName.LOAD_OBSERVED_LATENCY,
+                    max(0.0, completed_at - timing.started_at),
+                    labelvalues=self.source_labels(source),
+                )
+        if success:
+            # Credit loaded tokens only when the entire job succeeded; on any
+            # failure vLLM discards the blocks and recomputes.
+            for source, count in timing.tokens_by_source.items():
+                self._stats.increase_counter(
+                    RaidenOffloadMetricName.LOADED_TOKENS,
+                    count,
+                    labelvalues=self.source_labels(source),
+                )
+            return
+
+        # Blame only the tier(s) whose transfers failed, or that were still in
+        # flight when `drain_jobs` poisoned the job (`mark_poisoned`). Every
+        # failed job has such a tier: each path that fails a load marks one.
+        for tier in tiers:
+            if tier.failed:
+                self._stats.increase_counter(
+                    RaidenOffloadMetricName.FAILED_LOAD_JOBS,
+                    1,
+                    labelvalues=self.source_labels(tier.source),
+                )
 
     def pop_stats(self) -> OffloadingConnectorStats | None:
         """Drain accumulated per-step stats deltas for IPC, or `None` if idle.

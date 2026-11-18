@@ -1,6 +1,6 @@
 # KV Cache Offloading Metrics
 
-With `TPURaidenOffloadingConnector`, alone or as a child of `TPUMultiConnector`, the `/metrics` endpoint shows which tier served each prefix-cache hit: the engine's host DRAM pool, the pool of another engine, or the storage tier. For all other metrics, see [Production Metrics](https://docs.vllm.ai/en/latest/usage/metrics/) in the vLLM documentation.
+With `TPURaidenOffloadingConnector`, alone or as a child of `TPUMultiConnector`, the `/metrics` endpoint shows which tier served each prefix-cache hit: the engine's host DRAM pool, the pool of another engine, or the storage tier. It also shows, for each tier, the tokens that were loaded, how long the loads took, and how many loads failed. For all other metrics, see [Production Metrics](https://docs.vllm.ai/en/latest/usage/metrics/) in the vLLM documentation.
 
 ## `vllm:prompt_tokens_cached_by_source`
 
@@ -50,6 +50,27 @@ vllm:kv_offload_raiden_hit_tokens_total{backend="posix",engine="0",model_name="m
 
 > [!NOTE]
 > The API server process creates these series from its own settings: `kv_connector_extra_config`, and the `RAIDEN_STORAGE_PATH` and `RAIDEN_STORAGE_TYPE` environment variables. A single `vllm serve` command gives every process the same settings. In [multi-host serving](../user_guide/multihost.md), each host runs its own `vllm serve`, so set the storage tier on the host that serves `/metrics` as on the other hosts. Otherwise a `disk` series appears only with its first hit from storage.
+
+## Load metrics
+
+After a hit, the connector loads the cached blocks from their tiers into TPU memory (HBM). Three metrics follow these loads. They have the `source` and `backend` labels of `vllm:kv_offload_raiden_hit_tokens`, and their series are created at 0 at startup in the same way.
+
+| Metric | Type | Value |
+| :--- | :--- | :--- |
+| `vllm:kv_offload_raiden_loaded_tokens` | Counter | The tokens that were loaded from the tier. |
+| `vllm:kv_offload_raiden_load_observed_latency_seconds` | Histogram | The time that the tier's part of a load took, in seconds. |
+| `vllm:kv_offload_raiden_failed_load_jobs` | Counter | The loads in which the tier failed. |
+
+**Loaded tokens.** A load counts its tokens when all of it has completed, with the split by tier of its hit. It differs from `vllm:kv_offload_raiden_hit_tokens` in two cases:
+
+- A load that fails counts no tokens, because vLLM discards its blocks and computes them again.
+- A request that is admitted again after a preemption loads its blocks again. The second load counts its tokens. The hit is not counted again.
+
+**Latency.** A load can read from several tiers at the same time, and each tier gets its own sample: the time from the start of the load until the scheduler sees that the last block from this tier has arrived. So in one load, a slow read from storage does not hide a fast read from host DRAM. The scheduler looks for completed transfers once per step, so a sample is rounded up to the next step. While a batch runs, a step takes at least one forward pass.
+
+**Failed loads.** A failed load counts once for each tier that failed: its read was refused, its transfer failed, or it was still running when the scheduler stopped waiting for the load. A tier that completed its part is not counted. For example, a load reads from host DRAM and from storage, and the read from storage fails: `disk` grows by 1 and `host` does not, and the load still records the latency of `host`. A load that the scheduler stopped waiting for records no latency.
+
+A hit whose blocks were evicted before the load started appears in none of the three metrics, because no transfer started.
 
 ## Metrics that are not listed
 

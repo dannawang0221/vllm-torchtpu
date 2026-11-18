@@ -17,6 +17,7 @@ from __future__ import annotations
 
 from types import SimpleNamespace
 from typing import Any, cast
+from unittest.mock import Mock
 
 import prometheus_client
 import pytest
@@ -41,6 +42,16 @@ from vllm_torchtpu.offload.metrics import (
     split_external_hit,
 )
 from vllm_torchtpu.offload.raiden_connector import TPURaidenOffloadingConnector
+
+_HOST = ("host", "dram")
+_P2P = ("p2p", "rdma")
+_DISK = ("disk", "posix")
+
+
+def _pop_values(collector: RaidenOffloadStatsCollector) -> dict[str, Any]:
+    stats = collector.pop_stats()
+    assert stats is not None
+    return stats.data["data"]
 
 
 def _make_prom_metric_types(
@@ -68,7 +79,13 @@ def _make_prom_metric_types(
 def test_metric_definitions_have_source_labels() -> None:
     defs = build_raiden_offload_metric_definitions()
     assert set(defs.keys()) == {m.value for m in RaidenOffloadMetricName}
-    assert defs[RaidenOffloadMetricName.HIT_TOKENS].labelnames == SOURCE_LABELNAMES
+    for metric in (
+        RaidenOffloadMetricName.HIT_TOKENS,
+        RaidenOffloadMetricName.LOADED_TOKENS,
+        RaidenOffloadMetricName.LOAD_OBSERVED_LATENCY,
+        RaidenOffloadMetricName.FAILED_LOAD_JOBS,
+    ):
+        assert defs[metric].labelnames == SOURCE_LABELNAMES
 
 
 def test_external_sources_with_tokens() -> None:
@@ -291,6 +308,131 @@ def test_split_external_hit_sums_to_hit_count() -> None:
     assert split_external_hit({}, 16) == {CacheHitSource.EXTERNAL_UNSPECIFIED: 16}
 
 
+def test_load_records_loaded_tokens_and_each_tier_latency() -> None:
+    clock = Mock(return_value=10.0)
+    collector = RaidenOffloadStatsCollector(storage_backend="posix", clock=clock)
+    timing = collector.start_load_timing(
+        num_host_sub_hashes=2,
+        remote_sources={b"p0": CacheHitSource.P2P, b"d0": CacheHitSource.DISK},
+        tokens_by_source={
+            CacheHitSource.HOST: 16,
+            CacheHitSource.P2P: 32,
+            CacheHitSource.DISK: 48,
+        },
+    )
+    # The host tier lands 2 ms after the launch, the peer read 8 ms after it,
+    # and the storage read 40 ms after it.
+    clock.return_value += 0.002
+    timing.on_sub_hash_done(b"h0", clock())
+    timing.on_sub_hash_done(b"h1", clock())
+    clock.return_value += 0.006
+    timing.on_sub_hash_done(b"p0", clock())
+    clock.return_value += 0.032
+    timing.on_sub_hash_done(b"d0", clock())
+    collector.on_load_finalized(timing, success=True)
+
+    values = _pop_values(collector)
+    assert values[RaidenOffloadMetricName.LOADED_TOKENS] == {
+        _HOST: 16,
+        _P2P: 32,
+        _DISK: 48,
+    }
+    assert values[RaidenOffloadMetricName.LOAD_OBSERVED_LATENCY] == {
+        _HOST: [pytest.approx(0.002)],
+        _P2P: [pytest.approx(0.008)],
+        _DISK: [pytest.approx(0.04)],
+    }
+    assert RaidenOffloadMetricName.FAILED_LOAD_JOBS not in values
+
+
+@pytest.mark.parametrize(
+    ("steps", "poisoned", "blamed", "timed"),
+    [
+        # read_remote() is never called, so the remote tiers are not blamed.
+        pytest.param(
+            [("mark_local_launch_failed",)],
+            False,
+            {_HOST},
+            set(),
+            id="host load refused",
+        ),
+        pytest.param(
+            [("mark_remote_launch_failed", [b"d0"])],
+            False,
+            {_DISK},
+            set(),
+            id="storage read refused",
+        ),
+        # The first read_remote() batch, peer p0 and the storage read, is in
+        # flight when the batch of peer p1 is refused.
+        pytest.param(
+            [
+                ("mark_remote_launch_failed", [b"p1"]),
+                ("on_sub_hash_done", b"p0", 1.0),
+                ("on_sub_hash_done", b"d0", 1.0),
+            ],
+            False,
+            {_P2P},
+            {_DISK},
+            id="second peer batch refused",
+        ),
+        pytest.param(
+            [("on_sub_hash_done", b"h0", 1.0), ("on_sub_hash_failed", b"d0")],
+            False,
+            {_DISK},
+            {_HOST},
+            id="storage read failed",
+        ),
+        # A failure that Raiden reports for a sub-hash that had landed.
+        pytest.param(
+            [("on_sub_hash_done", b"h0", 1.0), ("on_sub_hash_failed", b"h0")],
+            False,
+            {_HOST},
+            set(),
+            id="failure reported after completion",
+        ),
+        # The host tier landed before drain_jobs timed out. A poisoned job
+        # records no latency.
+        pytest.param(
+            [
+                ("on_sub_hash_done", b"h0", 1.0),
+                ("mark_poisoned",),
+                ("on_sub_hash_done", b"d0", 2.0),
+            ],
+            True,
+            {_P2P, _DISK},
+            set(),
+            id="poisoned with remote reads in flight",
+        ),
+    ],
+)
+def test_failed_load_blames_only_failed_or_in_flight_tiers(
+    steps: list[tuple[Any, ...]],
+    poisoned: bool,
+    blamed: set[tuple[str, str]],
+    timed: set[tuple[str, str]],
+) -> None:
+    collector = RaidenOffloadStatsCollector(storage_backend="posix")
+    # One host DRAM sub-hash (h0), two peer reads and one storage read.
+    timing = collector.start_load_timing(
+        num_host_sub_hashes=1,
+        remote_sources={
+            b"p0": CacheHitSource.P2P,
+            b"p1": CacheHitSource.P2P,
+            b"d0": CacheHitSource.DISK,
+        },
+        tokens_by_source={CacheHitSource.HOST: 16},
+    )
+    for method, *args in steps:
+        getattr(timing, method)(*args)
+    collector.on_load_finalized(timing, success=False, poisoned=poisoned)
+
+    values = _pop_values(collector)
+    assert values[RaidenOffloadMetricName.FAILED_LOAD_JOBS] == dict.fromkeys(blamed, 1)
+    assert set(values.get(RaidenOffloadMetricName.LOAD_OBSERVED_LATENCY, {})) == timed
+    assert RaidenOffloadMetricName.LOADED_TOKENS not in values
+
+
 def test_prom_metrics_registration_and_end_to_end_observation() -> None:
     registry = prometheus_client.CollectorRegistry()
     extra = {"cpu_bytes_to_use": 1 << 20}
@@ -322,10 +464,24 @@ def test_prom_metrics_registration_and_end_to_end_observation() -> None:
     assert RaidenOffloadMetricName.HIT_TOKENS in families
     assert not any(name.startswith("vllm:kv_offload_cpu_") for name in families)
 
-    collector = RaidenOffloadStatsCollector(
-        storage_backend="posix",
-    )
+    clock = Mock(return_value=1.0)
+    collector = RaidenOffloadStatsCollector(storage_backend="posix", clock=clock)
     collector.record_admission_hits({CacheHitSource.DISK: 32})
+    load_timing = collector.start_load_timing(
+        num_host_sub_hashes=0,
+        remote_sources={b"d0": CacheHitSource.DISK, b"d1": CacheHitSource.DISK},
+        tokens_by_source={CacheHitSource.DISK: 32},
+    )
+    clock.return_value += 0.05
+    load_timing.on_sub_hash_done(b"d0", clock())
+    load_timing.on_sub_hash_done(b"d1", clock())
+    collector.on_load_finalized(load_timing, success=True)
+
+    failed_timing = collector.start_load_timing(
+        num_host_sub_hashes=0, remote_sources={b"p0": CacheHitSource.P2P}
+    )
+    failed_timing.on_sub_hash_failed(b"p0")
+    collector.on_load_finalized(failed_timing, success=False)
 
     raw_stats = collector.pop_stats()
     assert raw_stats is not None
@@ -344,12 +500,35 @@ def test_prom_metrics_registration_and_end_to_end_observation() -> None:
     # Raiden's spec declares no config info labels.
     assert registry.get_sample_value("vllm:kv_offload_config_info", base_labels) == 1.0
     disk_load_labels = {**base_labels, "source": "disk", "backend": "posix"}
+    p2p_load_labels = {**base_labels, "source": "p2p", "backend": "rdma"}
 
     assert (
         registry.get_sample_value(
             "vllm:kv_offload_raiden_hit_tokens_total", disk_load_labels
         )
         == 32.0
+    )
+    assert (
+        registry.get_sample_value(
+            "vllm:kv_offload_raiden_loaded_tokens_total", disk_load_labels
+        )
+        == 32.0
+    )
+    assert (
+        registry.get_sample_value(
+            "vllm:kv_offload_raiden_load_observed_latency_seconds_count",
+            disk_load_labels,
+        )
+        == 1.0
+    )
+    assert registry.get_sample_value(
+        "vllm:kv_offload_raiden_load_observed_latency_seconds_sum", disk_load_labels
+    ) == pytest.approx(0.05)
+    assert (
+        registry.get_sample_value(
+            "vllm:kv_offload_raiden_failed_load_jobs_total", p2p_load_labels
+        )
+        == 1.0
     )
     # Deprecated CPUOffloadingSpec metric stays at its initial 0.0 value.
     assert (
@@ -378,13 +557,13 @@ def test_prom_metrics_registration_and_end_to_end_observation() -> None:
         ),
     ],
 )
-def test_prom_metrics_start_each_configured_tier_hit_series_at_zero(
+def test_prom_metrics_start_each_configured_tier_series_at_zero(
     monkeypatch: pytest.MonkeyPatch,
     tier_config: dict[str, Any],
     env: dict[str, str],
     configured_tiers: set[tuple[str, str]],
 ) -> None:
-    """`rate()` misses the first hit of a series that only appears with it."""
+    """`rate()` misses the first increment of a series that only appears with it."""
     for name in ("RAIDEN_STORAGE_PATH", "RAIDEN_STORAGE_TYPE"):
         monkeypatch.delenv(name, raising=False)
     for name, value in env.items():
@@ -404,18 +583,24 @@ def test_prom_metrics_start_each_configured_tier_hit_series_at_zero(
         {0: ["test-model", "0"], 1: ["test-model", "1"]},
     )
 
-    for engine in ("0", "1"):
-        for source, backend in (("host", "dram"), ("p2p", "rdma"), ("disk", "posix")):
-            value = registry.get_sample_value(
-                "vllm:kv_offload_raiden_hit_tokens_total",
-                {
-                    "model_name": "test-model",
-                    "engine": engine,
-                    "source": source,
-                    "backend": backend,
-                },
-            )
-            assert value == (0.0 if (source, backend) in configured_tiers else None)
+    for sample in (
+        "vllm:kv_offload_raiden_hit_tokens_total",
+        "vllm:kv_offload_raiden_loaded_tokens_total",
+        "vllm:kv_offload_raiden_failed_load_jobs_total",
+        "vllm:kv_offload_raiden_load_observed_latency_seconds_count",
+    ):
+        for engine in ("0", "1"):
+            for tier in (_HOST, _P2P, _DISK):
+                value = registry.get_sample_value(
+                    sample,
+                    {
+                        "model_name": "test-model",
+                        "engine": engine,
+                        "source": tier[0],
+                        "backend": tier[1],
+                    },
+                )
+                assert value == (0.0 if tier in configured_tiers else None), sample
 
 
 def test_tpu_multi_connector_builds_and_observes_raiden_offload_prom_metrics() -> None:

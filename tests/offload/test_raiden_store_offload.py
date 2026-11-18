@@ -4534,8 +4534,9 @@ class TestHitSourcesBySource(unittest.TestCase):
         _ = sched.get_stats()
 
         # Simulate host eviction + request preemption and re-admission from
-        # shared storage: get_external_cache_hit_sources still reports DISK,
-        # while HIT_TOKENS is not incremented again.
+        # shared storage: get_external_cache_hit_sources still reports DISK and
+        # LOADED_TOKENS still counts the physical reload, while HIT_TOKENS is
+        # not incremented again.
         store.entries.clear()
         sched2 = _make_real_scheduler(manager, block_size=self.BLOCK, hybrid=True)
         req2 = _make_hashed_request("req2", 3 * self.BLOCK + 1, self.BLOCK)
@@ -4555,6 +4556,17 @@ class TestHitSourcesBySource(unittest.TestCase):
         assert stats2 is not None
         self.assertNotIn(RaidenOffloadMetricName.HIT_TOKENS, stats2.data["data"])
         self.assertIsNone(manager.get_stats())
+        for key in (k_attn0, k_attn1, k_mamba1):
+            store.complete_remote_read(sub_hashes(key))
+        (reload_finished,) = manager.poll_finished_jobs()
+        self.assertTrue(reload_finished.success)
+        reload_stats = sched2.get_stats()
+        assert reload_stats is not None
+        self.assertNotIn(RaidenOffloadMetricName.HIT_TOKENS, reload_stats.data["data"])
+        self.assertEqual(
+            reload_stats.data["data"][RaidenOffloadMetricName.LOADED_TOKENS],
+            {("disk", "posix"): 2 * self.BLOCK},
+        )
 
     def test_hybrid_hit_with_mixed_recurrent_state_counts_in_its_slowest_tier(self):
         from vllm.v1.core.kv_cache_manager import KVCacheBlocks
@@ -4597,7 +4609,7 @@ class TestHitSourcesBySource(unittest.TestCase):
             {CacheHitSource.DISK: 2 * self.BLOCK},
         )
 
-    def test_unpinned_load_reports_unspecified_and_no_hit_tokens(self):
+    def test_unpinned_load_reports_unspecified_and_no_raiden_metrics(self):
         from vllm.v1.core.kv_cache_manager import KVCacheBlocks
         from vllm.v1.core.kv_cache_utils import KVCacheBlock
         from vllm.v1.core.sched.output import SchedulerOutput
@@ -4625,10 +4637,13 @@ class TestHitSourcesBySource(unittest.TestCase):
             sched.get_external_cache_hit_sources(req, ext_tokens),
             {CacheHitSource.EXTERNAL_UNSPECIFIED: self.BLOCK},
         )
-        sched.build_connector_meta(SchedulerOutput.make_empty())
+        # The load fails without a transfer, so it is not a failed load job.
+        meta = sched.build_connector_meta(SchedulerOutput.make_empty())
+        self.assertEqual(meta.failed_load_req_ids, {"req"})
         stats = sched.get_stats()
         assert stats is not None
-        self.assertNotIn(RaidenOffloadMetricName.HIT_TOKENS, stats.data["data"])
+        for metric_name in RaidenOffloadMetricName:
+            self.assertNotIn(metric_name, stats.data["data"])
 
     def test_request_without_offload_hit_records_nothing(self):
         from vllm.v1.core.kv_cache_manager import KVCacheBlocks
@@ -4904,6 +4919,170 @@ class TestPrepareLoadKeySources(unittest.TestCase):
                 mixed: ((host, 2), (p2p, 1), (disk, 1)),
             },
         )
+
+
+class TestLoadMetricsBySource(unittest.TestCase):
+    """Loaded tokens, load latency, and failed load jobs of each tier."""
+
+    BLOCK = 16
+    HOST, P2P, DISK = ("host", "dram"), ("p2p", "rdma"), ("disk", "posix")
+
+    def setUp(self):
+        from vllm.v1.metrics.cache_hit_source import CacheHitSource
+
+        self.clock = MagicMock(return_value=100.0)
+        self.store = FakeKVCacheStore()
+        self.manager = make_global_manager(
+            self.store, storage_backend="posix", metrics_clock=self.clock
+        )
+        # One key of BLOCK tokens in each tier.
+        self.host_key, self.peer_key, self.disk_key = _key(1), _key(2), _key(3)
+        seed_host_entries(self.store, self.host_key)
+        seed_global_entries(self.store, self.peer_key)
+        seed_storage_entries(self.store, self.disk_key)
+        self.source_of = {
+            self.host_key: CacheHitSource.HOST,
+            self.peer_key: CacheHitSource.P2P,
+            self.disk_key: CacheHitSource.DISK,
+        }
+
+    def _launch_load(self, *keys: bytes) -> None:
+        """Launch job 1, which loads `keys`."""
+        for key in keys:
+            self.assertEqual(self.manager.lookup(key, _ctx()), LookupResult.HIT)
+        self.manager.prepare_load(list(keys), _ctx())
+        self.manager.submit_load_job(
+            1,
+            list(keys),
+            list(range(10, 10 + len(keys))),
+            "req",
+            tokens_by_source={self.source_of[key]: self.BLOCK for key in keys},
+        )
+
+    def _finish(self) -> SimpleNamespace:
+        """Whether the job that just finished succeeded, and its load metrics."""
+        from vllm_torchtpu.offload.metrics import RaidenOffloadMetricName
+
+        (finished,) = self.manager.poll_finished_jobs()
+        stats = self.manager.get_stats()
+        assert stats is not None
+        values = stats.data["data"]
+        return SimpleNamespace(
+            success=finished.success,
+            loaded_tokens=values.get(RaidenOffloadMetricName.LOADED_TOKENS, {}),
+            latency=values.get(RaidenOffloadMetricName.LOAD_OBSERVED_LATENCY, {}),
+            failed_jobs=values.get(RaidenOffloadMetricName.FAILED_LOAD_JOBS, {}),
+        )
+
+    def test_each_tier_records_its_latency_and_loaded_tokens(self):
+        self._launch_load(self.host_key, self.peer_key, self.disk_key)
+        # The host tier lands 1.5 ms after the launch, the peer read 8 ms after
+        # it, and the storage read 45 ms after it.
+        self.clock.return_value += 0.0015
+        self.store.complete_load(sub_hashes(self.host_key))
+        self.assertEqual(self.manager.poll_finished_jobs(), [])
+        self.clock.return_value += 0.0065
+        self.store.complete_remote_read(sub_hashes(self.peer_key))
+        self.assertEqual(self.manager.poll_finished_jobs(), [])
+        self.clock.return_value += 0.037
+        self.store.complete_remote_read(sub_hashes(self.disk_key))
+
+        result = self._finish()
+        self.assertTrue(result.success)
+        self.assertEqual(
+            result.loaded_tokens,
+            {self.HOST: self.BLOCK, self.P2P: self.BLOCK, self.DISK: self.BLOCK},
+        )
+        self.assertEqual(set(result.latency), {self.HOST, self.P2P, self.DISK})
+        for tier, seconds in (
+            (self.HOST, 0.0015),
+            (self.P2P, 0.008),
+            (self.DISK, 0.045),
+        ):
+            (latency,) = result.latency[tier]
+            self.assertAlmostEqual(latency, seconds)
+        self.assertEqual(result.failed_jobs, {})
+
+    def test_refused_host_load_blames_the_host_tier(self):
+        self.store.fail_load = True
+        self._launch_load(self.host_key, self.disk_key)
+
+        result = self._finish()
+        self.assertFalse(result.success)
+        # read_remote() was never called, so the storage tier is not blamed.
+        self.assertEqual(result.failed_jobs, {self.HOST: 1})
+        self.assertEqual(result.latency, {})
+        self.assertEqual(result.loaded_tokens, {})
+
+    def test_refused_peer_read_blames_p2p_and_keeps_the_host_latency(self):
+        self.store.fail_read_remote = True
+        self._launch_load(self.host_key, self.peer_key)
+        self.clock.return_value += 0.002
+        self.store.complete_load(sub_hashes(self.host_key))
+
+        result = self._finish()
+        self.assertFalse(result.success)
+        self.assertEqual(result.failed_jobs, {self.P2P: 1})
+        self.assertEqual(set(result.latency), {self.HOST})
+        self.assertAlmostEqual(result.latency[self.HOST][0], 0.002)
+        self.assertEqual(result.loaded_tokens, {})
+
+    def test_failed_storage_read_blames_the_storage_tier(self):
+        self._launch_load(self.host_key, self.disk_key)
+        self.store.complete_load(sub_hashes(self.host_key))
+        self.store.complete_remote_read(sub_hashes(self.disk_key), success=False)
+
+        result = self._finish()
+        self.assertFalse(result.success)
+        self.assertEqual(result.failed_jobs, {self.DISK: 1})
+        self.assertEqual(set(result.latency), {self.HOST})
+        self.assertEqual(result.loaded_tokens, {})
+
+    def test_drain_timeout_blames_the_tiers_in_flight_and_records_no_latency(self):
+        from vllm_torchtpu.offload import raiden_store as rs
+
+        self._launch_load(self.host_key, self.disk_key)
+        # The host tier lands before the drain. Only the storage read is in
+        # flight when the drain times out and poisons the job.
+        self.store.complete_load(sub_hashes(self.host_key))
+        self.assertEqual(self.manager.poll_finished_jobs(), [])
+        with patch.object(rs, "_DRAIN_TIMEOUT_S", 0.0):
+            self.manager.drain_jobs({1})
+        self.store.complete_remote_read(sub_hashes(self.disk_key))
+
+        result = self._finish()
+        self.assertFalse(result.success)
+        self.assertEqual(result.failed_jobs, {self.DISK: 1})
+        self.assertEqual(result.latency, {})
+        self.assertEqual(result.loaded_tokens, {})
+
+    def test_repeated_completion_report_does_not_stamp_the_tier_early(self):
+        self._launch_load(self.host_key)
+        s0, s1, s2, s3 = sub_hashes(self.host_key)
+        self.clock.return_value += 0.001
+        self.store.complete_load([s0, s1, s2])
+        self.store._load_done.append(s0)  # The same sub-hash reported again.
+        self.assertEqual(self.manager.poll_finished_jobs(), [])
+        self.clock.return_value += 0.004
+        self.store.complete_load([s3])
+
+        result = self._finish()
+        self.assertTrue(result.success)
+        (latency,) = result.latency[self.HOST]
+        self.assertAlmostEqual(latency, 0.005)
+
+    def test_failure_report_for_a_landed_sub_hash_blames_its_tier(self):
+        self._launch_load(self.host_key)
+        landed, *others = sub_hashes(self.host_key)
+        self.store.complete_load([landed])
+        self.assertEqual(self.manager.poll_finished_jobs(), [])
+        self.store._load_failed.append(landed)  # Reported again, as failed.
+        self.store.complete_load(others)
+
+        result = self._finish()
+        self.assertFalse(result.success)
+        self.assertEqual(result.failed_jobs, {self.HOST: 1})
+        self.assertEqual(result.latency, {})
 
 
 if __name__ == "__main__":
