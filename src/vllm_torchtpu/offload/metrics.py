@@ -20,9 +20,9 @@ Host/Peer/Storage transfers from the scheduler-side `KVCacheStore` controller
 
 - `compute_load_tokens_by_source` runs in `EngineCore`, computing deduplicated
   token counts per tier for one offload hit.
-- `RaidenOffloadStatsCollector` runs in `EngineCore`, counting hit tokens,
-  loaded tokens, load latencies, and failed load jobs per tier, and draining
-  per-step deltas as `OffloadingConnectorStats` via `pop_stats()`.
+- `RaidenOffloadStatsCollector` runs in `EngineCore`, counting hit tokens and
+  the tokens, latencies, and failed jobs of loads and saves per tier, and
+  draining per-step deltas as `OffloadingConnectorStats` via `pop_stats()`.
 - `RaidenOffloadPromMetrics` runs in the API server process, registering
   Raiden's `OffloadingSpec` metric definitions and applying IPC stats deltas to
   Prometheus counters and histograms.
@@ -32,10 +32,12 @@ from __future__ import annotations
 
 import copy
 import enum
+import itertools
 import time
 from collections import Counter
-from collections.abc import Callable, Collection, Iterable, Mapping
+from collections.abc import Callable, Collection, Iterable, Mapping, Sequence
 from dataclasses import dataclass
+from typing import TYPE_CHECKING
 
 from vllm.config import VllmConfig
 from vllm.distributed.kv_transfer.kv_connector.v1.metrics import (
@@ -46,17 +48,24 @@ from vllm.distributed.kv_transfer.kv_connector.v1.offloading.metrics import (
     OffloadingConnectorStats,
     OffloadPromMetrics,
 )
+from vllm.v1.kv_cache_interface import FullAttentionSpec, MambaSpec
 from vllm.v1.kv_offload.base import (
     OffloadingCounterMetadata,
     OffloadingHistogramMetadata,
     OffloadingMetricMetadata,
     OffloadingSpec,
     OffloadKey,
+    ReqContext,
     get_offload_group_idx,
 )
 from vllm.v1.metrics.cache_hit_source import CacheHitSource
 
 from vllm_torchtpu.logger import init_logger
+
+if TYPE_CHECKING:
+    from vllm.distributed.kv_transfer.kv_connector.v1.offloading.scheduler import (
+        GroupOffloadConfig,
+    )
 
 logger = init_logger(__name__)
 
@@ -65,8 +74,10 @@ logger = init_logger(__name__)
 # upstream `vllm:prompt_tokens_cached_by_source` for PromQL rollups. `backend`
 # names what serves the tier: `dram` for host, `rdma` for p2p, and the
 # configured storage type for disk, so a new storage backend adds label values
-# rather than metrics.
+# rather than metrics. Save metrics have `destination` in place of `source`:
+# it labels where data is written to.
 SOURCE_LABELNAMES: tuple[str, str] = ("source", "backend")
+DESTINATION_LABELNAMES: tuple[str, str] = ("destination", "backend")
 UNKNOWN_BACKEND_LABEL = "unknown"
 HOST_OFFLOAD_LABELS: tuple[str, str] = (CacheHitSource.HOST.value, "dram")
 P2P_OFFLOAD_LABELS: tuple[str, str] = (CacheHitSource.P2P.value, "rdma")
@@ -111,8 +122,11 @@ class RaidenOffloadMetricName(enum.StrEnum):
 
     HIT_TOKENS = "vllm:kv_offload_raiden_hit_tokens"
     LOADED_TOKENS = "vllm:kv_offload_raiden_loaded_tokens"
+    SAVED_TOKENS = "vllm:kv_offload_raiden_saved_tokens"
     LOAD_OBSERVED_LATENCY = "vllm:kv_offload_raiden_load_observed_latency_seconds"
+    SAVE_OBSERVED_LATENCY = "vllm:kv_offload_raiden_save_observed_latency_seconds"
     FAILED_LOAD_JOBS = "vllm:kv_offload_raiden_failed_load_jobs"
+    FAILED_SAVE_JOBS = "vllm:kv_offload_raiden_failed_save_jobs"
 
 
 def build_raiden_offload_metric_definitions() -> dict[str, OffloadingMetricMetadata]:
@@ -135,6 +149,14 @@ def build_raiden_offload_metric_definitions() -> dict[str, OffloadingMetricMetad
             ),
             labelnames=SOURCE_LABELNAMES,
         ),
+        RaidenOffloadMetricName.SAVED_TOKENS: OffloadingCounterMetadata(
+            documentation=(
+                "Number of prompt tokens whose KV cache was successfully saved "
+                "from device HBM to external offload tiers, counted once across "
+                "KV cache groups, labeled by destination and backend."
+            ),
+            labelnames=DESTINATION_LABELNAMES,
+        ),
         RaidenOffloadMetricName.LOAD_OBSERVED_LATENCY: OffloadingHistogramMetadata(
             documentation=(
                 "Seconds from launching a KV offload load until the scheduler "
@@ -146,6 +168,17 @@ def build_raiden_offload_metric_definitions() -> dict[str, OffloadingMetricMetad
             labelnames=SOURCE_LABELNAMES,
             buckets=OFFLOAD_LATENCY_BUCKETS,
         ),
+        RaidenOffloadMetricName.SAVE_OBSERVED_LATENCY: OffloadingHistogramMetadata(
+            documentation=(
+                "Seconds from launching a KV offload save until the scheduler "
+                "observes it commit, including retries, labeled by destination "
+                "and backend. Completion is polled once per scheduler step, so "
+                "values are rounded up to the next step (at least one forward "
+                "pass while a batch runs)."
+            ),
+            labelnames=DESTINATION_LABELNAMES,
+            buckets=OFFLOAD_LATENCY_BUCKETS,
+        ),
         RaidenOffloadMetricName.FAILED_LOAD_JOBS: OffloadingCounterMetadata(
             documentation=(
                 "Number of KV offload load jobs that failed after prepare_load "
@@ -154,7 +187,35 @@ def build_raiden_offload_metric_definitions() -> dict[str, OffloadingMetricMetad
             ),
             labelnames=SOURCE_LABELNAMES,
         ),
+        RaidenOffloadMetricName.FAILED_SAVE_JOBS: OffloadingCounterMetadata(
+            documentation=(
+                "Number of KV offload save jobs that failed, labeled by "
+                "destination and backend."
+            ),
+            labelnames=DESTINATION_LABELNAMES,
+        ),
     }
+
+
+def select_saved_tokens_group(
+    groups: Sequence[GroupOffloadConfig],
+) -> GroupOffloadConfig:
+    """Pick the offloaded KV cache group whose store keys count `saved_tokens`.
+
+    Groups save the same prompt tokens in separate store jobs (recurrent
+    boundary states in `align` mode, sliding-window tails), so counting every
+    group credits a token once per group. Full attention stores every prompt
+    chunk, so it is preferred, then any non-recurrent group.
+    """
+    full_attention = [
+        group for group in groups if isinstance(group.kv_cache_spec, FullAttentionSpec)
+    ]
+    non_recurrent = [
+        group for group in groups if not isinstance(group.kv_cache_spec, MambaSpec)
+    ]
+    return min(
+        full_attention or non_recurrent or groups, key=lambda group: group.group_idx
+    )
 
 
 def _add_unobserved_histogram(
@@ -183,9 +244,9 @@ class RaidenOffloadPromMetrics(OffloadPromMetrics):
     `KVTransferConfig` are mutated.
 
     `configured_tier_labels` holds the `(source, backend)` labels of the tiers
-    the deployment enables. Each engine's hit and load series for these tiers
-    are created at 0 on startup. Prometheus counts a series from the first
-    value it scrapes, so `rate()` and `increase()` would miss the first
+    the deployment enables. Each engine's hit, load, and save series for these
+    tiers are created at 0 on startup. Prometheus counts a series from the
+    first value it scrapes, so `rate()` and `increase()` would miss the first
     increment of a series that only appeared with that increment.
     """
 
@@ -226,6 +287,23 @@ class RaidenOffloadPromMetrics(OffloadPromMetrics):
             _add_unobserved_histogram(
                 zero_stats, RaidenOffloadMetricName.LOAD_OBSERVED_LATENCY, labelvalues
             )
+        # A save writes host DRAM, and with a storage tier it writes through to
+        # storage and completes there. Saves never go to peers.
+        save_destinations = [HOST_OFFLOAD_LABELS]
+        storage_backend = dict(configured_tier_labels).get(CacheHitSource.DISK.value)
+        if storage_backend is not None:
+            save_destinations.append(disk_offload_labels(storage_backend))
+        for labelvalues in save_destinations:
+            for counter in (
+                RaidenOffloadMetricName.SAVED_TOKENS,
+                RaidenOffloadMetricName.FAILED_SAVE_JOBS,
+            ):
+                zero_stats.increase_counter(counter, 0, labelvalues=labelvalues)
+        _add_unobserved_histogram(
+            zero_stats,
+            RaidenOffloadMetricName.SAVE_OBSERVED_LATENCY,
+            save_destinations[-1],
+        )
         for engine_idx in per_engine_labelvalues:
             self.observe(zero_stats.data, engine_idx)
 
@@ -371,6 +449,102 @@ def compute_load_tokens_by_source(
     return external_sources_with_tokens(sources)
 
 
+@dataclass(frozen=True)
+class StoreKeyTokenRanges:
+    """Token ranges of the keys of one store job that count `saved_tokens`.
+
+    The offloading scheduler computes them for the keys of the group that
+    `select_saved_tokens_group` picked, and passes them to the manager with the
+    job. `tokens_per_chunk` and `atomic` say how a key that is saved in part
+    splits by sub-block, see `saved_sub_block_ranges`.
+    """
+
+    key_ranges: Mapping[OffloadKey, tuple[int, int]]
+    tokens_per_chunk: int
+    # Recurrent state: all its sub-blocks are needed to restore it.
+    atomic: bool
+
+
+def compute_store_key_token_ranges(
+    keys: Iterable[OffloadKey],
+    req_context: ReqContext,
+    group: GroupOffloadConfig,
+) -> StoreKeyTokenRanges:
+    """Derive `[start_token, end_token)` spans for `group`'s store keys.
+
+    `req_context.get_offload_key_position(key)` records the 1-based exclusive
+    end token boundary of `key`; rounding `(end_token - 1)` down to a multiple
+    of `tokens_per_chunk` recovers the chunk's `start_token`, handling both full
+    blocks and partial-tail boundary keys. Keys of other groups get no span.
+    """
+    tokens_per_chunk = group.tokens_per_chunk
+    key_ranges: dict[OffloadKey, tuple[int, int]] = {}
+    for key in keys:
+        if get_offload_group_idx(key) != group.group_idx:
+            continue
+        end_token = req_context.get_offload_key_position(key)
+        if end_token is None or end_token <= 0:
+            continue
+        start_token = ((end_token - 1) // tokens_per_chunk) * tokens_per_chunk
+        key_ranges[key] = (start_token, end_token)
+    return StoreKeyTokenRanges(
+        key_ranges=key_ranges,
+        tokens_per_chunk=tokens_per_chunk,
+        atomic=isinstance(group.kv_cache_spec, MambaSpec),
+    )
+
+
+def saved_sub_block_ranges(
+    key_range: tuple[int, int],
+    saved: Sequence[bool],
+    tokens_per_chunk: int,
+    *,
+    atomic: bool,
+) -> list[tuple[int, int]]:
+    """Token ranges of a chunk-aligned `key_range` that its saved sub-blocks hold.
+
+    `saved[i]` says whether sub-block `i` was written by this save (the others
+    were already host-resident). An attention sub-block holds
+    `tokens_per_chunk // len(saved)` consecutive tokens. A recurrent (`atomic`)
+    state, or a chunk that does not split evenly, is credited whole once any of
+    its sub-blocks is saved.
+    """
+    if all(saved):
+        return [key_range]
+    if atomic or tokens_per_chunk % len(saved):
+        return [key_range] if any(saved) else []
+    lo, hi = key_range
+    tokens_per_sub = tokens_per_chunk // len(saved)
+    ranges: list[tuple[int, int]] = []
+    offset = 0
+    for is_saved, run in itertools.groupby(saved):
+        run_len = sum(1 for _ in run)
+        run_lo = lo + offset * tokens_per_sub
+        run_hi = min(hi, run_lo + run_len * tokens_per_sub)
+        if is_saved and run_lo < run_hi:
+            ranges.append((run_lo, run_hi))
+        offset += run_len
+    return ranges
+
+
+def count_merged_tokens(ranges: Iterable[tuple[int, int]]) -> int:
+    """Count unique covered tokens across potentially overlapping intervals."""
+    intervals = sorted((lo, hi) for lo, hi in ranges if lo < hi)
+    if not intervals:
+        return 0
+    total = 0
+    cur_lo, cur_hi = intervals[0]
+    for lo, hi in intervals[1:]:
+        if lo <= cur_hi:
+            if hi > cur_hi:
+                cur_hi = hi
+        else:
+            total += cur_hi - cur_lo
+            cur_lo, cur_hi = lo, hi
+    total += cur_hi - cur_lo
+    return total
+
+
 @dataclass(slots=True)
 class _TierProgress:
     """Completion state of the sub-hashes one load job reads from one tier."""
@@ -443,6 +617,14 @@ class LoadTimingState:
         tier.completed_at = None
 
 
+@dataclass
+class SaveTimingState:
+    """Per-job transfer timing and token count state for an active save."""
+
+    started_at: float
+    saved_tokens: int
+
+
 class RaidenOffloadStatsCollector:
     """Scheduler-side collector producing `OffloadingConnectorStats` deltas."""
 
@@ -490,6 +672,18 @@ class RaidenOffloadStatsCollector:
                 return disk_offload_labels(UNKNOWN_BACKEND_LABEL)
             return disk_offload_labels(self._storage_backend)
         raise ValueError(f"Unsupported offload source for metrics: {source!r}")
+
+    def _save_destination_labels(self) -> tuple[str, str]:
+        """Return `(destination, backend)` for save latency and failure metrics.
+
+        When secondary storage is configured, Raiden `KVCacheStore::Save()`
+        writes through `HBM -> Host DRAM -> Shared Storage` atomically and only
+        marks `poll_save_status()` done once storage commits. Revisit this for
+        a storage backend that completes saves before its storage commits.
+        """
+        if self._storage_backend is not None:
+            return disk_offload_labels(self._storage_backend)
+        return HOST_OFFLOAD_LABELS
 
     def record_admission_hits(
         self,
@@ -588,6 +782,60 @@ class RaidenOffloadStatsCollector:
                     RaidenOffloadMetricName.FAILED_LOAD_JOBS,
                     1,
                     labelvalues=self.source_labels(tier.source),
+                )
+
+    def record_failed_save(self, *, launched: bool) -> None:
+        """Count a failed save job.
+
+        A save that never launched (insert rejected, or `save()` refused) failed
+        in the host pool. A launched save writes through to storage when a
+        storage tier is configured, so its failure is labeled with the save
+        destination.
+        """
+        self._stats.increase_counter(
+            RaidenOffloadMetricName.FAILED_SAVE_JOBS,
+            1,
+            labelvalues=(
+                self._save_destination_labels() if launched else HOST_OFFLOAD_LABELS
+            ),
+        )
+
+    def start_save_timing(
+        self,
+        *,
+        saved_token_ranges: Iterable[tuple[int, int]],
+    ) -> SaveTimingState:
+        """Initialize timing and deduplicated token count for an active save."""
+        return SaveTimingState(
+            started_at=self.now(),
+            saved_tokens=count_merged_tokens(saved_token_ranges),
+        )
+
+    def on_save_finalized(self, timing: SaveTimingState, *, success: bool) -> None:
+        """Emit save token, latency, and failure metrics."""
+        if not success:
+            self.record_failed_save(launched=True)
+            return
+        duration = max(0.0, self.now() - timing.started_at)
+        destination_labels = self._save_destination_labels()
+        self._stats.observe_histogram(
+            RaidenOffloadMetricName.SAVE_OBSERVED_LATENCY,
+            duration,
+            labelvalues=destination_labels,
+        )
+        if timing.saved_tokens > 0:
+            # Write-through storage saves retain staged blocks in Host DRAM in
+            # addition to writing shared storage, so credit both destinations.
+            self._stats.increase_counter(
+                RaidenOffloadMetricName.SAVED_TOKENS,
+                timing.saved_tokens,
+                labelvalues=HOST_OFFLOAD_LABELS,
+            )
+            if self._storage_backend is not None:
+                self._stats.increase_counter(
+                    RaidenOffloadMetricName.SAVED_TOKENS,
+                    timing.saved_tokens,
+                    labelvalues=disk_offload_labels(self._storage_backend),
                 )
 
     def pop_stats(self) -> OffloadingConnectorStats | None:

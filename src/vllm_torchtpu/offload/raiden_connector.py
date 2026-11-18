@@ -98,7 +98,10 @@ from vllm_torchtpu import envs as tpu_envs
 from vllm_torchtpu.logger import init_logger
 from vllm_torchtpu.offload.metrics import (
     RaidenOffloadPromMetrics,
+    StoreKeyTokenRanges,
     compute_load_tokens_by_source,
+    compute_store_key_token_ranges,
+    select_saved_tokens_group,
     split_external_hit,
 )
 from vllm_torchtpu.offload.raiden_store import (
@@ -206,6 +209,7 @@ class _ParkedStore:
 
     keys: list[OffloadKey]
     device_block_ids: list[int]
+    token_ranges: StoreKeyTokenRanges
     acks: int = 0
 
 
@@ -231,6 +235,9 @@ class TPURaidenOffloadingScheduler(OffloadingConnectorScheduler):
         assert isinstance(self.manager, RaidenOffloadingManager)
         self._raiden_manager: RaidenOffloadingManager = self.manager
         self._fence_pending: dict[int, _ParkedStore] = {}
+        self._saved_tokens_group = select_saved_tokens_group(
+            self.config.kv_group_configs
+        )
 
     def _load_spec(self, req_id: str) -> RaidenLoadStoreSpec:
         """The source spec of the load job this step created for `req_id`."""
@@ -311,7 +318,13 @@ class TPURaidenOffloadingScheduler(OffloadingConnectorScheduler):
                 len(dst_spec.keys),
             )
             self._fence_pending[job_id] = _ParkedStore(
-                keys=dst_spec.keys, device_block_ids=device_block_ids
+                keys=dst_spec.keys,
+                device_block_ids=device_block_ids,
+                token_ranges=compute_store_key_token_ranges(
+                    dst_spec.keys,
+                    self._req_status[job.req_id].req_context,
+                    self._saved_tokens_group,
+                ),
             )
             new_fence_ids.add(job_id)
 
@@ -395,7 +408,10 @@ class TPURaidenOffloadingScheduler(OffloadingConnectorScheduler):
                 if parked.acks == self.config.num_workers:
                     del self._fence_pending[job_id]
                     self._raiden_manager.submit_store_job(
-                        job_id, parked.keys, parked.device_block_ids
+                        job_id,
+                        parked.keys,
+                        parked.device_block_ids,
+                        token_ranges=parked.token_ranges,
                     )
         super().update_connector_output(connector_output)
 

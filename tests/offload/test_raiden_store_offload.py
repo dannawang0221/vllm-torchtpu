@@ -1128,6 +1128,12 @@ class TestSchedulerFenceFlow(unittest.TestCase):
         sched.config = SimpleNamespace(num_workers=num_workers)
         sched._raiden_manager = manager
         sched._fence_pending = {}
+        # What parking a store job reads: the context of its request, and the
+        # group that counts saved tokens.
+        sched._req_status = {"r1": SimpleNamespace(req_context=_ctx("r1"))}
+        sched._saved_tokens_group = SimpleNamespace(
+            group_idx=0, tokens_per_chunk=16, kv_cache_spec=None
+        )
         return sched
 
     def _stock_meta(self, store_jobs=None, load_jobs=None, jobs_to_flush=None):
@@ -5083,6 +5089,239 @@ class TestLoadMetricsBySource(unittest.TestCase):
         self.assertFalse(result.success)
         self.assertEqual(result.failed_jobs, {self.HOST: 1})
         self.assertEqual(result.latency, {})
+
+
+class TestSaveMetricsByDestination(unittest.TestCase):
+    """Saved tokens, save latency, and failed save jobs of each destination."""
+
+    BLOCK = 16
+    HOST, DISK = ("host", "dram"), ("disk", "posix")
+
+    def setUp(self):
+        self._new_manager("posix")
+
+    def _new_manager(self, storage_backend):
+        self.clock = MagicMock(return_value=100.0)
+        self.store = FakeKVCacheStore()
+        self.manager = make_manager(
+            self.store, storage_backend=storage_backend, metrics_clock=self.clock
+        )
+
+    def _save(self, key_ranges, *, atomic=False) -> None:
+        """Submit store job 1 for the keys of `key_ranges`, which has their
+        token ranges as the scheduler passes them."""
+        from vllm_torchtpu.offload.metrics import StoreKeyTokenRanges
+
+        keys = list(key_ranges)
+        self.manager.submit_store_job(
+            1,
+            keys,
+            list(range(10, 10 + len(keys))),
+            token_ranges=StoreKeyTokenRanges(
+                key_ranges=key_ranges, tokens_per_chunk=self.BLOCK, atomic=atomic
+            ),
+        )
+
+    def _finish(self) -> SimpleNamespace:
+        """Whether the job that just finished succeeded, and its save metrics."""
+        from vllm_torchtpu.offload.metrics import RaidenOffloadMetricName
+
+        (finished,) = self.manager.poll_finished_jobs()
+        stats = self.manager.get_stats()
+        assert stats is not None
+        values = stats.data["data"]
+        return SimpleNamespace(
+            success=finished.success,
+            saved_tokens=values.get(RaidenOffloadMetricName.SAVED_TOKENS, {}),
+            latency=values.get(RaidenOffloadMetricName.SAVE_OBSERVED_LATENCY, {}),
+            failed_jobs=values.get(RaidenOffloadMetricName.FAILED_SAVE_JOBS, {}),
+        )
+
+    def test_save_counts_tokens_and_latency_by_destination(self):
+        for storage_backend, destinations, completes_at in (
+            (None, [self.HOST], self.HOST),
+            # With a storage tier, a save also writes host DRAM, and completes
+            # in storage.
+            ("posix", [self.HOST, self.DISK], self.DISK),
+        ):
+            with self.subTest(storage_backend=storage_backend):
+                self._new_manager(storage_backend)
+                key = _group_key(0, 0)
+                self._save({key: (0, 16)})
+                self.clock.return_value += 0.004
+                self.store.complete_save(sub_hashes(key))
+
+                result = self._finish()
+                self.assertTrue(result.success)
+                self.assertEqual(result.saved_tokens, dict.fromkeys(destinations, 16))
+                self.assertEqual(set(result.latency), {completes_at})
+                self.assertAlmostEqual(result.latency[completes_at][0], 0.004)
+                self.assertEqual(result.failed_jobs, {})
+
+    def test_scheduler_counts_the_tokens_of_one_group(self):
+        from vllm.v1.core.sched.output import (
+            KVConnectorBlockState,
+            NewRequestData,
+            SchedulerOutput,
+        )
+        from vllm.v1.outputs import KVConnectorOutput
+
+        from vllm_torchtpu.offload.metrics import RaidenOffloadMetricName
+        from vllm_torchtpu.offload.raiden_connector import (
+            RaidenOffloadingWorkerMetadata,
+        )
+
+        sched = _make_real_scheduler(self.manager, block_size=self.BLOCK, hybrid=True)
+        req = _make_hashed_request("req", 2 * self.BLOCK + 1, self.BLOCK)
+        req.num_computed_tokens = 2 * self.BLOCK
+        sched.on_new_request(req)
+        block_ids = ([10, 11], [0, 21])
+        sched_out = SchedulerOutput.make_empty()
+        sched_out.scheduled_new_reqs = [NewRequestData.from_request(req, block_ids)]
+        sched_out.num_scheduled_tokens = {req.request_id: 2 * self.BLOCK + 1}
+        # With mamba_cache_mode="align", vLLM hands over the recurrent state at
+        # token 32, and the scheduler stores it in a job of its own.
+        sched_out.kv_connector_block_state = KVConnectorBlockState(
+            req_ids={req.request_id},
+            resolve_block_ids=lambda _: block_ids,
+            boundary_state_offloads={req.request_id: [(1, 21, 2 * self.BLOCK)]},
+        )
+        meta = sched.build_connector_meta(sched_out)
+        # Both ranks acknowledge the fences, which launches the two saves.
+        sched.update_connector_output(
+            KVConnectorOutput(
+                kv_connector_worker_meta=RaidenOffloadingWorkerMetadata(
+                    fenced_jobs=dict.fromkeys(meta.fence_job_ids, 2)
+                )
+            )
+        )
+        save_calls = self.store.calls_named("save")
+        # The recurrent state in one job, the 2 attention blocks in the other,
+        # of 4 sub-blocks each.
+        self.assertEqual(sorted(len(call.args[0]) for call in save_calls), [4, 8])
+        for call in save_calls:
+            self.store.complete_save(call.args[0])
+        finished = self.manager.poll_finished_jobs()
+        self.assertEqual([job.success for job in finished], [True, True])
+
+        # The attention group counts tokens [0, 32) once. Counting the recurrent
+        # state of [16, 32) as well would give 48.
+        stats = self.manager.get_stats()
+        assert stats is not None
+        self.assertEqual(
+            stats.data["data"][RaidenOffloadMetricName.SAVED_TOKENS],
+            {self.HOST: 2 * self.BLOCK, self.DISK: 2 * self.BLOCK},
+        )
+
+    def test_block_already_in_host_dram_counts_no_tokens(self):
+        resident, new = _group_key(0, 0), _group_key(1, 0)
+        # Another request saved the first block before this job is submitted.
+        seed_host_entries(self.store, resident)
+        self._save({resident: (0, 16), new: (16, 32)})
+        self.store.complete_save(sub_hashes(new))
+
+        result = self._finish()
+        self.assertTrue(result.success)
+        self.assertEqual(result.saved_tokens, {self.HOST: 16, self.DISK: 16})
+
+    def test_job_with_nothing_to_save_records_nothing(self):
+        key = _group_key(0, 0)
+        seed_host_entries(self.store, key)
+        self._save({key: (0, 16)})
+
+        (finished,) = self.manager.poll_finished_jobs()
+        self.assertTrue(finished.success)
+        self.assertIsNone(self.manager.get_stats())
+
+    def test_block_saved_in_part_counts_its_saved_sub_blocks(self):
+        # The first 3 sub-blocks of the block of tokens [48, 64) are in host
+        # DRAM, so the save writes the last one: tokens [60, 64). Recurrent
+        # state cannot be split, so it counts whole.
+        for atomic, tokens in ((False, 4), (True, 16)):
+            with self.subTest(atomic=atomic):
+                self._new_manager("posix")
+                key = _group_key(3, 0)
+                *in_host, saved = sub_hashes(key)
+                for sub_hash in in_host:
+                    self.store.entries[sub_hash] = _Entry(status=FakeBlockStatus.HOST)
+                self._save({key: (48, 64)}, atomic=atomic)
+                self.store.complete_save([saved])
+
+                result = self._finish()
+                self.assertTrue(result.success)
+                self.assertEqual(
+                    result.saved_tokens, {self.HOST: tokens, self.DISK: tokens}
+                )
+
+    def test_save_that_did_not_launch_fails_in_host_dram(self):
+        key = _group_key(0, 0)
+        stale_entry = _Entry(status=FakeBlockStatus.HBM, device_block_id=99)
+        for refusal, entries in (
+            ("fail_insert", {}),
+            ("fail_save", {}),
+            # An entry that is bound to another device block fails the job.
+            (None, {sub_hashes(key)[0]: stale_entry}),
+        ):
+            with self.subTest(refusal=refusal):
+                self._new_manager("posix")
+                self.store.entries.update(entries)
+                if refusal:
+                    setattr(self.store, refusal, True)
+                self._save({key: (0, 16)})
+
+                result = self._finish()
+                self.assertFalse(result.success)
+                self.assertEqual(result.failed_jobs, {self.HOST: 1})
+                self.assertEqual(result.saved_tokens, {})
+                self.assertEqual(result.latency, {})
+
+    def test_launched_save_that_fails_is_counted_at_its_destination(self):
+        from vllm_torchtpu.offload import raiden_store as rs
+
+        for storage_backend, destination in ((None, self.HOST), ("posix", self.DISK)):
+            with self.subTest(storage_backend=storage_backend):
+                self._new_manager(storage_backend)
+                key = _group_key(0, 0)
+                with patch.object(rs, "_SAVE_RETRIES", 0):
+                    self._save({key: (0, 16)})
+                self.store.complete_save(sub_hashes(key), success=False)
+
+                result = self._finish()
+                self.assertFalse(result.success)
+                self.assertEqual(result.failed_jobs, {destination: 1})
+                self.assertEqual(result.saved_tokens, {})
+                self.assertEqual(result.latency, {})
+
+    def test_drain_timeout_counts_a_failed_save(self):
+        from vllm_torchtpu.offload import raiden_store as rs
+
+        key = _group_key(0, 0)
+        self._save({key: (0, 16)})
+        with patch.object(rs, "_DRAIN_TIMEOUT_S", 0.0):
+            self.manager.drain_jobs({1})
+        self.store.complete_save(sub_hashes(key))
+
+        result = self._finish()
+        self.assertFalse(result.success)
+        self.assertEqual(result.failed_jobs, {self.DISK: 1})
+        self.assertEqual(result.saved_tokens, {})
+        self.assertEqual(result.latency, {})
+
+    def test_retried_save_records_one_latency_from_its_first_launch(self):
+        key = _group_key(0, 0)
+        self._save({key: (0, 16)})
+        self.clock.return_value += 0.005
+        self.store.complete_save(sub_hashes(key), success=False)
+        self.assertEqual(self.manager.poll_finished_jobs(), [])
+        self.clock.return_value += 0.007
+        self.store.complete_save(sub_hashes(key))
+
+        result = self._finish()
+        self.assertTrue(result.success)
+        self.assertEqual(result.saved_tokens, {self.HOST: 16, self.DISK: 16})
+        (latency,) = result.latency[self.DISK]
+        self.assertAlmostEqual(latency, 0.012)
+        self.assertEqual(result.failed_jobs, {})
 
 
 if __name__ == "__main__":
