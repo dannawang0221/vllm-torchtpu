@@ -424,7 +424,13 @@ class FakeKVCacheStore:
 
 
 def make_manager(
-    store, *, device_block_size_factor=4, num_blocks=8, world_size=2, **kwargs
+    store,
+    *,
+    device_block_size_factor=4,
+    num_blocks=8,
+    world_size=2,
+    bytes_per_sub_block=256,
+    **kwargs,
 ):
     from vllm_torchtpu.offload.raiden_store import RaidenOffloadingManager
 
@@ -433,6 +439,7 @@ def make_manager(
         offload_logical_blocks_capacity=num_blocks,
         device_block_size_factor=device_block_size_factor,
         world_size=world_size,
+        bytes_per_sub_block=bytes_per_sub_block,
         raiden_controller_port=0,
         raiden_job_name="test",
         store=store,
@@ -3318,6 +3325,17 @@ class TestAllRanksKvBytesPerBlock(unittest.TestCase):
         spec = _build_spec({"cpu_bytes_to_use": 1 << 20}, pp_size=2)
         self.assertEqual(spec.offload_logical_blocks_capacity, (1 << 20) // 49152)
 
+    def test_manager_gets_the_bytes_of_a_sub_block_from_the_recorded_sum(self):
+        from vllm_torchtpu.offload import raiden_store as rs
+
+        rs.record_all_ranks_kv_bytes_per_block(
+            [_worker_config(4096)] * 4 + [_worker_config(8192)] * 4
+        )
+        spec = _build_spec({}, pp_size=2)
+        manager_kwargs, _ = _get_manager_and_worker(spec, pp_world_size=2)
+        # A block has 49152 bytes on the 8 ranks, in 4 sub-blocks.
+        self.assertEqual(manager_kwargs["bytes_per_sub_block"], 49152 // 4)
+
     def test_single_stage_without_a_record_uses_the_world_size(self):
         spec = _build_spec({"cpu_bytes_to_use": 1 << 20})
         self.assertEqual(spec.offload_logical_blocks_capacity, (1 << 20) // (4096 * 4))
@@ -4967,7 +4985,10 @@ class TestLoadMetricsBySource(unittest.TestCase):
 
     def _finish(self) -> SimpleNamespace:
         """Whether the job that just finished succeeded, and its load metrics."""
-        from vllm_torchtpu.offload.metrics import RaidenOffloadMetricName
+        from vllm_torchtpu.offload.metrics import (
+            OffloadTransferMetricName,
+            RaidenOffloadMetricName,
+        )
 
         (finished,) = self.manager.poll_finished_jobs()
         stats = self.manager.get_stats()
@@ -4978,6 +4999,8 @@ class TestLoadMetricsBySource(unittest.TestCase):
             loaded_tokens=values.get(RaidenOffloadMetricName.LOADED_TOKENS, {}),
             latency=values.get(RaidenOffloadMetricName.LOAD_OBSERVED_LATENCY, {}),
             failed_jobs=values.get(RaidenOffloadMetricName.FAILED_LOAD_JOBS, {}),
+            transfer_bytes=values.get(OffloadTransferMetricName.LOAD_BYTES, {}),
+            transfer_seconds=values.get(OffloadTransferMetricName.LOAD_TIME, {}),
         )
 
     def test_each_tier_records_its_latency_and_loaded_tokens(self):
@@ -5008,6 +5031,10 @@ class TestLoadMetricsBySource(unittest.TestCase):
             (latency,) = result.latency[tier]
             self.assertAlmostEqual(latency, seconds)
         self.assertEqual(result.failed_jobs, {})
+        # The load as a whole: 3 blocks of 4 sub-blocks of 256 bytes, in the
+        # time of its slowest tier.
+        self.assertEqual(result.transfer_bytes, {(): 3 * 4 * 256})
+        self.assertAlmostEqual(result.transfer_seconds[()], 0.045)
 
     def test_refused_host_load_blames_the_host_tier(self):
         self.store.fail_load = True
@@ -5124,7 +5151,10 @@ class TestSaveMetricsByDestination(unittest.TestCase):
 
     def _finish(self) -> SimpleNamespace:
         """Whether the job that just finished succeeded, and its save metrics."""
-        from vllm_torchtpu.offload.metrics import RaidenOffloadMetricName
+        from vllm_torchtpu.offload.metrics import (
+            OffloadTransferMetricName,
+            RaidenOffloadMetricName,
+        )
 
         (finished,) = self.manager.poll_finished_jobs()
         stats = self.manager.get_stats()
@@ -5135,6 +5165,7 @@ class TestSaveMetricsByDestination(unittest.TestCase):
             saved_tokens=values.get(RaidenOffloadMetricName.SAVED_TOKENS, {}),
             latency=values.get(RaidenOffloadMetricName.SAVE_OBSERVED_LATENCY, {}),
             failed_jobs=values.get(RaidenOffloadMetricName.FAILED_SAVE_JOBS, {}),
+            transfer_bytes=values.get(OffloadTransferMetricName.STORE_BYTES, {}),
         )
 
     def test_save_counts_tokens_and_latency_by_destination(self):
@@ -5166,7 +5197,10 @@ class TestSaveMetricsByDestination(unittest.TestCase):
         )
         from vllm.v1.outputs import KVConnectorOutput
 
-        from vllm_torchtpu.offload.metrics import RaidenOffloadMetricName
+        from vllm_torchtpu.offload.metrics import (
+            OffloadTransferMetricName,
+            RaidenOffloadMetricName,
+        )
         from vllm_torchtpu.offload.raiden_connector import (
             RaidenOffloadingWorkerMetadata,
         )
@@ -5212,6 +5246,10 @@ class TestSaveMetricsByDestination(unittest.TestCase):
             stats.data["data"][RaidenOffloadMetricName.SAVED_TOKENS],
             {self.HOST: 2 * self.BLOCK, self.DISK: 2 * self.BLOCK},
         )
+        # The bytes of both jobs count: 12 sub-blocks of 256 bytes.
+        self.assertEqual(
+            stats.data["data"][OffloadTransferMetricName.STORE_BYTES], {(): 12 * 256}
+        )
 
     def test_block_already_in_host_dram_counts_no_tokens(self):
         resident, new = _group_key(0, 0), _group_key(1, 0)
@@ -5252,6 +5290,8 @@ class TestSaveMetricsByDestination(unittest.TestCase):
                 self.assertEqual(
                     result.saved_tokens, {self.HOST: tokens, self.DISK: tokens}
                 )
+                # Either way, the save writes one sub-block of 256 bytes.
+                self.assertEqual(result.transfer_bytes, {(): 256})
 
     def test_save_that_did_not_launch_fails_in_host_dram(self):
         key = _group_key(0, 0)

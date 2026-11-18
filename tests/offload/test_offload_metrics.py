@@ -24,6 +24,9 @@ import pytest
 import torch
 from vllm.config import KVTransferConfig, VllmConfig
 from vllm.distributed.kv_transfer.kv_connector.v1.metrics import PromMetric
+from vllm.distributed.kv_transfer.kv_connector.v1.offloading.metrics import (
+    get_connector_metric_definitions,
+)
 from vllm.v1.kv_cache_interface import FullAttentionSpec, MambaSpec, SlidingWindowSpec
 from vllm.v1.kv_offload.base import OffloadKey, ReqContext, make_offload_key
 from vllm.v1.kv_offload.factory import OffloadingSpecFactory
@@ -35,6 +38,7 @@ from vllm_torchtpu.distributed.kv_transfer.tpu_multi_connector import TPUMultiCo
 from vllm_torchtpu.offload.metrics import (
     DESTINATION_LABELNAMES,
     SOURCE_LABELNAMES,
+    OffloadTransferMetricName,
     RaidenOffloadMetricName,
     RaidenOffloadPromMetrics,
     RaidenOffloadStatsCollector,
@@ -54,6 +58,7 @@ from vllm_torchtpu.offload.raiden_connector import TPURaidenOffloadingConnector
 _HOST = ("host", "dram")
 _P2P = ("p2p", "rdma")
 _DISK = ("disk", "posix")
+_SUB_BLOCK_BYTES = 256
 
 _ATTN = FullAttentionSpec(
     block_size=16, num_kv_heads=1, head_size=8, dtype=torch.bfloat16
@@ -71,6 +76,10 @@ def _group(group_idx: int, kv_cache_spec: Any) -> Any:
     return SimpleNamespace(
         group_idx=group_idx, tokens_per_chunk=16, kv_cache_spec=kv_cache_spec
     )
+
+
+def _collector(**kwargs: Any) -> RaidenOffloadStatsCollector:
+    return RaidenOffloadStatsCollector(bytes_per_sub_block=_SUB_BLOCK_BYTES, **kwargs)
 
 
 def _pop_values(collector: RaidenOffloadStatsCollector) -> dict[str, Any]:
@@ -99,6 +108,12 @@ def _make_prom_metric_types(
         prometheus_client.Gauge: _Gauge,
         prometheus_client.Histogram: _Histogram,
     }
+
+
+def test_transfer_metric_names_match_upstream_connector_definitions() -> None:
+    upstream_defs = get_connector_metric_definitions()
+    for metric_name in OffloadTransferMetricName:
+        assert metric_name.value in upstream_defs
 
 
 def test_metric_definitions_have_source_or_destination_labels() -> None:
@@ -135,7 +150,7 @@ def test_external_sources_with_tokens() -> None:
 
 
 def test_collector_labels_disk_without_storage_backend_as_unknown() -> None:
-    collector = RaidenOffloadStatsCollector(storage_backend=None)
+    collector = _collector(storage_backend=None)
     assert collector.source_labels(CacheHitSource.DISK) == ("disk", "unknown")
 
 
@@ -148,7 +163,7 @@ def test_collector_labels_disk_without_storage_backend_as_unknown() -> None:
     ],
 )
 def test_collector_rejects_unsupported_sources(source: Any) -> None:
-    collector = RaidenOffloadStatsCollector(storage_backend=None)
+    collector = _collector(storage_backend=None)
     with pytest.raises(ValueError, match="Unsupported offload source"):
         collector.source_labels(source)
 
@@ -341,7 +356,7 @@ def test_split_external_hit_sums_to_hit_count() -> None:
 
 def test_load_records_loaded_tokens_and_each_tier_latency() -> None:
     clock = Mock(return_value=10.0)
-    collector = RaidenOffloadStatsCollector(storage_backend="posix", clock=clock)
+    collector = _collector(storage_backend="posix", clock=clock)
     timing = collector.start_load_timing(
         num_host_sub_hashes=2,
         remote_sources={b"p0": CacheHitSource.P2P, b"d0": CacheHitSource.DISK},
@@ -374,6 +389,11 @@ def test_load_records_loaded_tokens_and_each_tier_latency() -> None:
         _DISK: [pytest.approx(0.04)],
     }
     assert RaidenOffloadMetricName.FAILED_LOAD_JOBS not in values
+    # The load as a whole: the bytes of its 4 sub-blocks, and the time of its
+    # slowest tier.
+    assert values[OffloadTransferMetricName.LOAD_BYTES] == {(): 4 * _SUB_BLOCK_BYTES}
+    assert values[OffloadTransferMetricName.LOAD_SIZE] == {(): [4 * _SUB_BLOCK_BYTES]}
+    assert values[OffloadTransferMetricName.LOAD_TIME] == {(): pytest.approx(0.04)}
 
 
 @pytest.mark.parametrize(
@@ -443,7 +463,7 @@ def test_failed_load_blames_only_failed_or_in_flight_tiers(
     blamed: set[tuple[str, str]],
     timed: set[tuple[str, str]],
 ) -> None:
-    collector = RaidenOffloadStatsCollector(storage_backend="posix")
+    collector = _collector(storage_backend="posix")
     # One host DRAM sub-hash (h0), two peer reads and one storage read.
     timing = collector.start_load_timing(
         num_host_sub_hashes=1,
@@ -462,6 +482,7 @@ def test_failed_load_blames_only_failed_or_in_flight_tiers(
     assert values[RaidenOffloadMetricName.FAILED_LOAD_JOBS] == dict.fromkeys(blamed, 1)
     assert set(values.get(RaidenOffloadMetricName.LOAD_OBSERVED_LATENCY, {})) == timed
     assert RaidenOffloadMetricName.LOADED_TOKENS not in values
+    assert not set(values) & set(OffloadTransferMetricName)
 
 
 @pytest.mark.parametrize(
@@ -580,10 +601,10 @@ def test_save_records_tokens_latency_and_failures_by_destination(
     failed: dict[tuple[str, str], int],
 ) -> None:
     clock = Mock(return_value=50.0)
-    collector = RaidenOffloadStatsCollector(
-        storage_backend=storage_backend, clock=clock
+    collector = _collector(storage_backend=storage_backend, clock=clock)
+    timing = collector.start_save_timing(
+        saved_token_ranges=[(0, 64)], num_saved_sub_hashes=4
     )
-    timing = collector.start_save_timing(saved_token_ranges=[(0, 64)])
     clock.return_value += 0.005
     collector.on_save_finalized(timing, success=success)
 
@@ -593,6 +614,17 @@ def test_save_records_tokens_latency_and_failures_by_destination(
         {latency_at: [pytest.approx(0.005)]} if latency_at else {}
     )
     assert values.get(RaidenOffloadMetricName.FAILED_SAVE_JOBS, {}) == failed
+    # A save that completed also counts the bytes of its 4 sub-blocks, and its
+    # time. These metrics have no destination.
+    assert values.get(OffloadTransferMetricName.STORE_BYTES, {}) == (
+        {(): 4 * _SUB_BLOCK_BYTES} if success else {}
+    )
+    assert values.get(OffloadTransferMetricName.STORE_SIZE, {}) == (
+        {(): [4 * _SUB_BLOCK_BYTES]} if success else {}
+    )
+    assert values.get(OffloadTransferMetricName.STORE_TIME, {}) == (
+        {(): pytest.approx(0.005)} if success else {}
+    )
 
 
 def test_prom_metrics_registration_and_end_to_end_observation() -> None:
@@ -627,7 +659,7 @@ def test_prom_metrics_registration_and_end_to_end_observation() -> None:
     assert not any(name.startswith("vllm:kv_offload_cpu_") for name in families)
 
     clock = Mock(return_value=1.0)
-    collector = RaidenOffloadStatsCollector(storage_backend="posix", clock=clock)
+    collector = _collector(storage_backend="posix", clock=clock)
     collector.record_admission_hits({CacheHitSource.DISK: 32})
     load_timing = collector.start_load_timing(
         num_host_sub_hashes=0,
@@ -639,7 +671,9 @@ def test_prom_metrics_registration_and_end_to_end_observation() -> None:
     load_timing.on_sub_hash_done(b"d1", clock())
     collector.on_load_finalized(load_timing, success=True)
 
-    save_timing = collector.start_save_timing(saved_token_ranges=[(0, 32)])
+    save_timing = collector.start_save_timing(
+        saved_token_ranges=[(0, 32)], num_saved_sub_hashes=2
+    )
     clock.return_value += 0.02
     collector.on_save_finalized(save_timing, success=True)
 
@@ -722,6 +756,12 @@ def test_prom_metrics_registration_and_end_to_end_observation() -> None:
         )
         == 1.0
     )
+    # The load and the save moved 2 sub-blocks each.
+    for sample in (
+        "vllm:kv_offload_load_bytes_total",
+        "vllm:kv_offload_store_bytes_total",
+    ):
+        assert registry.get_sample_value(sample, base_labels) == 2 * _SUB_BLOCK_BYTES
     # Deprecated CPUOffloadingSpec metric stays at its initial 0.0 value.
     assert (
         registry.get_sample_value(
@@ -812,6 +852,18 @@ def test_prom_metrics_start_each_configured_tier_series_at_zero(
                     },
                 )
                 assert value == (0.0 if tier in tiers else None), (sample, tier)
+    # vLLM's transfer metrics have no tier label: one series for each engine.
+    for engine in ("0", "1"):
+        for sample in (
+            "vllm:kv_offload_load_bytes_total",
+            "vllm:kv_offload_load_time_total",
+            "vllm:kv_offload_load_size_count",
+            "vllm:kv_offload_store_bytes_total",
+            "vllm:kv_offload_store_time_total",
+            "vllm:kv_offload_store_size_count",
+        ):
+            labels = {"model_name": "test-model", "engine": engine}
+            assert registry.get_sample_value(sample, labels) == 0.0, sample
 
 
 def test_tpu_multi_connector_builds_and_observes_raiden_offload_prom_metrics() -> None:
@@ -853,7 +905,7 @@ def test_tpu_multi_connector_builds_and_observes_raiden_offload_prom_metrics() -
     )
     assert multi_prom is not None
 
-    collector = RaidenOffloadStatsCollector(storage_backend="posix")
+    collector = _collector(storage_backend="posix")
     collector.record_admission_hits({CacheHitSource.DISK: 64})
     offload_stats = collector.pop_stats()
     assert offload_stats is not None

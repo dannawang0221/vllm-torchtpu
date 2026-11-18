@@ -1,6 +1,6 @@
 # KV Cache Offloading Metrics
 
-With `TPURaidenOffloadingConnector`, alone or as a child of `TPUMultiConnector`, the `/metrics` endpoint shows which tier served each prefix-cache hit: the engine's host DRAM pool, the pool of another engine, or the storage tier. It also shows, for each tier, the tokens that were loaded and saved, how long the loads and saves took, and how many of them failed. For all other metrics, see [Production Metrics](https://docs.vllm.ai/en/latest/usage/metrics/) in the vLLM documentation.
+With `TPURaidenOffloadingConnector`, alone or as a child of `TPUMultiConnector`, the `/metrics` endpoint shows which tier served each prefix-cache hit: the engine's host DRAM pool, the pool of another engine, or the storage tier. It also shows, for each tier, the tokens that were loaded and saved, how long the loads and saves took, and how many of them failed. The connector also records the bytes and the time of loads and saves in vLLM's transfer metrics. For all other metrics, see [Production Metrics](https://docs.vllm.ai/en/latest/usage/metrics/) in the vLLM documentation.
 
 ## `vllm:prompt_tokens_cached_by_source`
 
@@ -100,6 +100,25 @@ There is no `p2p` destination: an engine does not save into the pool of another 
 **Failed saves.** A save that could not start counts under `host`, because the host DRAM pool refused it. A save that started and then failed counts under the tier where saves complete.
 
 The series of these metrics are created at 0 at startup too: the two counters for `host` and for a configured storage tier, and the latency for the tier where saves complete.
+
+## Transfer bytes and time
+
+vLLM has six metrics for the size and the time of loads and saves. They have no tier label. With this connector, the scheduler records them, once for each load or save that completed:
+
+| Metric | Type | Value |
+| :--- | :--- | :--- |
+| `vllm:kv_offload_load_bytes` | Counter | The bytes that were loaded into TPU memory (HBM). |
+| `vllm:kv_offload_load_time` | Counter | The time that these loads took, in seconds. |
+| `vllm:kv_offload_load_size` | Histogram | The bytes of each load. |
+| `vllm:kv_offload_store_bytes` | Counter | The bytes that were saved from TPU memory (HBM). |
+| `vllm:kv_offload_store_time` | Counter | The time that these saves took, in seconds. |
+| `vllm:kv_offload_store_size` | Histogram | The bytes of each save. |
+
+**Bytes.** The bytes of a load or save are the bytes of its blocks on all workers of the engine together. A save counts the blocks that it writes: a block that is already in host DRAM is not saved again. With a storage tier, a save writes host DRAM and storage, and its bytes count once.
+
+**Time.** The time of a load runs from its start until the scheduler sees that its last block has arrived, from whichever tier. The time of a save is its save latency. Both are rounded up to the next scheduler step, so the bytes divided by the time give a lower bound of the transfer speed.
+
+A load or save that fails counts no bytes and no time. The series of these metrics are created at 0 at startup, for each engine.
 
 ## Metrics that are not listed
 

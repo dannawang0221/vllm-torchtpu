@@ -371,6 +371,9 @@ class RaidenOffloadingManager(OffloadingManager):
         offload_logical_blocks_capacity: int,
         device_block_size_factor: int,
         world_size: int,
+        # Host bytes of one sub-block, summed over every worker rank: the
+        # unit of the transfer byte metrics.
+        bytes_per_sub_block: int,
         raiden_controller_port: int,
         raiden_job_name: str,
         global_registry_address: str = "",
@@ -538,6 +541,7 @@ class RaidenOffloadingManager(OffloadingManager):
         self._hash_to_admission: dict[bytes, Admission] = {}
         self._finished: list[FinishedJob] = []
         self._metrics = RaidenOffloadStatsCollector(
+            bytes_per_sub_block=bytes_per_sub_block,
             storage_backend=storage_backend,
             clock=metrics_clock,
         )
@@ -1139,6 +1143,7 @@ class RaidenOffloadingManager(OffloadingManager):
             saved_token_ranges=self._saved_token_ranges(
                 keys, sub_hashes, to_save, token_ranges
             ),
+            num_saved_sub_hashes=len(to_save),
         )
         if not self._store.save(to_save):
             # Synchronous launch failure: finalize immediately to revert the
@@ -2697,6 +2702,9 @@ class TPURaidenStoreOffloadingSpec(OffloadingSpec):
                 config.worker_kv_bytes_per_block * self.world_size
             )
         assert bytes_per_block_all_ranks > 0
+        self.bytes_per_sub_block = (
+            bytes_per_block_all_ranks // self.device_block_size_factor
+        )
         self.offload_logical_blocks_capacity = int(
             int(cpu_bytes_to_use) // bytes_per_block_all_ranks
         )
@@ -2841,6 +2849,7 @@ class TPURaidenStoreOffloadingSpec(OffloadingSpec):
                 offload_logical_blocks_capacity=self.offload_logical_blocks_capacity,
                 device_block_size_factor=self.device_block_size_factor,
                 world_size=self.world_size,
+                bytes_per_sub_block=self.bytes_per_sub_block,
                 raiden_controller_port=self.raiden_controller_port,
                 raiden_job_name=self.raiden_job_name,
                 global_registry_address=self.global_registry_address,
